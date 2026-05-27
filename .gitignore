@@ -1,0 +1,22 @@
+# 环境变量（含密码）
+.env
+.env.bak
+
+# Python
+__pycache__/
+*.pyc
+
+# 输出报表（每次运行生成，不入库）
+reports/
+*.xlsx
+!prev_balance_sample.xlsx
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# WorkBuddy
+.workbuddy/
+
+# Docker
+docker-compose.override.yml

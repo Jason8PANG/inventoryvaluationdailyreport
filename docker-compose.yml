@@ -1,0 +1,56 @@
+# ============================================================
+# Inventory Valuation Tracking - docker-compose.yml
+#
+# 使用方式：
+#   docker compose build       # 构建镜像
+#   docker compose up -d       # 启动守护进程（每天 09:00 自动执行）
+#   docker compose logs -f     # 查看日志
+#   docker compose down        # 停止（调度随之停止）
+#
+# 首次部署：
+#   docker network create public-net
+#   docker compose build
+#   docker compose up -d
+# ============================================================
+
+version: "3.9"
+
+services:
+  app:
+    build: .
+    container_name: nai-inventory-tracker
+    restart: unless-stopped   # 守护模式：进程退出后自动重启
+
+    # 挂载期初余额文件目录（宿主机路径:容器路径）
+    volumes:
+      - ./Previous Balance:/app/Previous Balance:ro   # 期初文件（只读）
+      - ./reports:/app/reports                        # 报表输出（可写）
+      - ./config.ini:/app/config.ini:ro               # 配置文件（只读）
+
+    # 所有配置通过 .env 注入（优先于 config.ini）
+    environment:
+      - TZ=Asia/Shanghai
+      # 邮件
+      - MAIL_TO=${MAIL_TO}
+      - MAIL_CC=${MAIL_CC}
+      - MAIL_FROM=${MAIL_FROM}
+      # SMTP
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_TLS=${SMTP_TLS}
+      # 数据库
+      - SQL_SERVER_HOST=${SQL_SERVER_HOST}
+      - SQL_SERVER_PORT=${SQL_SERVER_PORT}
+      - SQL_SERVER_DATABASE=${SQL_SERVER_DATABASE}
+      - SQL_SERVER_USERNAME=${SQL_SERVER_USERNAME}
+      - SQL_SERVER_PASSWORD=${SQL_SERVER_PASSWORD}
+
+    networks:
+      - public-net
+
+# 外部 Docker 网络（需预先创建：docker network create public-net）
+networks:
+  public-net:
+    external: true
