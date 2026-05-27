@@ -14,7 +14,7 @@
 9. 通过 config.ini 外部化配置（DB、SMTP、邮件收件人）
 
 作者: WorkBuddy for NAI Group
-日期: 2026-05-25 | 更新: 2026-05-27 (pymssql + SMTP + config.ini)
+日期: 2026-05-25 | 更新: 2026-05-27 (pymssql + SMTP + config.ini + 自动期初生成)
 """
 
 import os
@@ -906,33 +906,191 @@ def send_summary_email(
 
 
 # ──────────────────────────────────────────────────────────────
-# 守护进程 — 每日 9:00 自动执行
+# 期初库存生成 — 从 SLItems 表生成下月期初余额文件
 # ──────────────────────────────────────────────────────────────
-DAEMON_HOUR = 9
-DAEMON_MINUTE = 0
+
+def _db_connect(server, username, password, database, port=1433):
+    """独立的数据库连接函数（供非 Tracker 场景使用）"""
+    host = server
+    instance = None
+    if "\\" in host:
+        host, instance = host.split("\\", 1)
+
+    kwargs = dict(
+        server=f"{host}\\{instance}" if instance else host,
+        user=username,
+        password=password,
+        database=database,
+        tds_version="7.4",
+        login_timeout=15,
+        conn_properties="SET TEXTSIZE 65536",
+    )
+    if instance:
+        # 命名实例时不指定端口，由 SQL Browser 解析
+        kwargs["server"] = f"{host}\\{instance}"
+    else:
+        kwargs["port"] = port
+
+    return pymssql.connect(**kwargs)
+
+
+def generate_opening_balance(server, username, password, database, port=1433,
+                             output_dir="Previous Balance"):
+    """
+    从 SLItems 表读取各站点当前库存快照，生成本月期初余额 Excel 文件。
+    文件写入 output_dir/site XXX.xlsx，供日常报表读取。
+    仅导出 PMTCode='P'（采购物料），与日常报表口径一致。
+    """
+    print("=" * 60)
+    print("  生成期初库存余额文件 (SLItems Snapshot)")
+    print("=" * 60)
+
+    conn = _db_connect(server, username, password, database, port)
+    query = """
+        SELECT SiteRef,
+               item,
+               Description,
+               CASE PMTCode WHEN 'P' THEN 'Purchased'
+                            WHEN 'M' THEN 'Manufactured'
+                            ELSE 'Other' END AS Sourcing,
+               ProductCode,
+               OnHand AS Per,
+               DerUnitCost AS Unitcost
+        FROM [csi_datawarehouse].[dbo].[SLItems]
+        WHERE SiteRef IN ('310', '330', '410')
+          AND PMTCode = 'P'
+          AND OnHand <> 0
+        ORDER BY SiteRef, ProductCode, item
+    """
+
+    df = pd.read_sql(query, conn)
+    conn.close()
+
+    if df.empty:
+        print("  ⚠️ 未查询到任何数据")
+        return
+
+    # 确保输出目录存在
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    site_info = {
+        "310": "Plant1",
+        "330": "Plant2",
+        "410": "PNG",
+    }
+
+    results = []
+    for site_ref, group in df.groupby("SiteRef"):
+        label = site_info.get(site_ref, site_ref)
+        fname = out_path / f"site {site_ref}.xlsx"
+
+        export_df = group[["item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]].copy()
+        export_df.columns = ["Item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]
+        export_df["Item"] = export_df["Item"].astype(str).str.strip().str.upper()
+        export_df.to_excel(fname, index=False, sheet_name="Opening Balance")
+
+        total_items = len(export_df)
+        total_value = (pd.to_numeric(export_df["Per"], errors="coerce").fillna(0) *
+                       pd.to_numeric(export_df["Unitcost"], errors="coerce").fillna(0)).sum()
+
+        print(f"  ✅ Site {site_ref} ({label}): {total_items} items, 金额: ${total_value:,.2f}")
+        print(f"     → {fname}")
+        results.append({
+            "site": site_ref, "label": label,
+            "items": total_items, "value": total_value,
+        })
+
+    grand = sum(r["value"] for r in results)
+    print(f"\n  📊 总计: {sum(r['items'] for r in results)} items, Grand Total: ${grand:,.2f}")
+    print(f"  📁 文件目录: {out_path.resolve()}")
+    return results
+
+
+# ──────────────────────────────────────────────────────────────
+# 守护进程 — 每月1日 00:15 生成期初 + 每天 09:00 跑报表
+# ──────────────────────────────────────────────────────────────
+DAEMON_HOUR_OPENING = 0
+DAEMON_MINUTE_OPENING = 15
+DAEMON_HOUR_REPORT = 9
+DAEMON_MINUTE_REPORT = 0
+
+def _next_schedule(now):
+    """
+    计算下一次执行时间和任务类型。
+    规则：
+      - 每月1日 00:15：生成期初库存文件
+      - 每天 09:00：运行库存跟踪报表
+    返回 (target_datetime, task_type)  task_type = 'opening' | 'report'
+    """
+    def _make(hour, minute):
+        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    today_opening = _make(DAEMON_HOUR_OPENING, DAEMON_MINUTE_OPENING)
+    today_report = _make(DAEMON_HOUR_REPORT, DAEMON_MINUTE_REPORT)
+
+    candidates = []
+    # 每月1日 00:15 生成期初
+    if now.day == 1 and now < today_opening:
+        candidates.append((today_opening, "opening"))
+    # 每天 09:00 跑报表
+    if now < today_report:
+        candidates.append((today_report, "report"))
+
+    if candidates:
+        return min(candidates, key=lambda x: x[0])
+
+    # 今天的任务都过了，看明天
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if tomorrow.day == 1:
+        return (tomorrow.replace(hour=DAEMON_HOUR_OPENING, minute=DAEMON_MINUTE_OPENING), "opening")
+    else:
+        return (tomorrow.replace(hour=DAEMON_HOUR_REPORT, minute=DAEMON_MINUTE_REPORT), "report")
+
 
 def schedule_loop(run_func, args):
-    """无限循环，每天 9:00 执行 run_func。Docker 停止时收到 SIGTERM 自然退出。"""
-    print(f"⏰ Daemon mode: will run daily at {DAEMON_HOUR:02d}:{DAEMON_MINUTE:02d} (Asia/Shanghai)")
+    """
+    双调度守护进程：
+      - 每月1日 00:15：自动生成期初库存文件（从 SLItems 快照）
+      - 每天 09:00：运行库存跟踪报表 + 发邮件
+    Docker 停止时收到 SIGTERM 自然退出。
+    """
+    gen_args = dict(
+        server=args.server, username=args.username,
+        password=args.password, database=args.database,
+        port=args.db_port, output_dir=args.prev_dir,
+    )
+
+    print(f"⏰ Daemon mode started:")
+    print(f"   每月1日 {DAEMON_HOUR_OPENING:02d}:{DAEMON_MINUTE_OPENING:02d} → 生成期初库存文件")
+    print(f"   每天   {DAEMON_HOUR_REPORT:02d}:{DAEMON_MINUTE_REPORT:02d} → 运行库存跟踪报表")
+
     while True:
-        now = datetime.now()
-        target = now.replace(hour=DAEMON_HOUR, minute=DAEMON_MINUTE, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
-        wait_seconds = (target - now).total_seconds()
-        print(f"⏳ Next run at {target.strftime('%Y-%m-%d %H:%M:%S')} ({wait_seconds/3600:.1f}h)")
+        target, task_type = _next_schedule(datetime.now())
+        wait_seconds = (target - datetime.now()).total_seconds()
+
+        label = "生成期初库存" if task_type == "opening" else "运行库存报表"
+        print(f"⏳ Next: {target.strftime('%Y-%m-%d %H:%M:%S')} [{label}] ({wait_seconds/3600:.1f}h)")
+
         try:
-            time.sleep(wait_seconds)
+            time.sleep(max(wait_seconds, 0))
         except KeyboardInterrupt:
             print("\n🛑 Daemon stopped.")
             break
+
         try:
-            run_func(args)
+            if task_type == "opening":
+                print(f"\n{'='*60}")
+                print(f"  🔄 定时任务：生成期初库存文件")
+                print(f"{'='*60}")
+                generate_opening_balance(**gen_args)
+                # 生成期初后，当天 09:00 还会自动跑报表
+            else:
+                run_func(args)
         except Exception as e:
             print(f"❌ Scheduled run failed: {e}")
             import traceback
             traceback.print_exc()
-            # 出错后等待 5 分钟再重试，避免死循环刷日志
             time.sleep(300)
 
 
@@ -1017,7 +1175,8 @@ def main():
     parser.add_argument("--site", default="310", help="单站点模式 (默认310)")
     parser.add_argument("-f", "--prev-file", help="单站点期初余额Excel路径")
     parser.add_argument("--all-sites", action="store_true", help="批量运行310/330/410")
-    parser.add_argument("--daemon", action="store_true", help="守护模式：每天 09:00 自动执行")
+    parser.add_argument("--daemon", action="store_true", help="守护模式：每月1日 00:15 生成期初 + 每天 09:00 跑报表")
+    parser.add_argument("--generate-opening", action="store_true", help="手动从 SLItems 生成期初库存文件（不跑报表）")
     parser.add_argument("--prev-dir", default=db_sec.get("prev_dir", "Previous Balance"))
     parser.add_argument("--output-dir", default=db_sec.get("output_dir", None))
     parser.add_argument("-o", "--output", help="输出文件名 (单站点模式)")
@@ -1043,8 +1202,15 @@ def main():
 
     args = parser.parse_args()
 
-    if args.daemon:
-        # 守护模式：不立即执行，等到 09:00 再跑
+    if args.generate_opening:
+        # 手动生成期初模式
+        generate_opening_balance(
+            server=args.server, username=args.username,
+            password=args.password, database=args.database,
+            port=args.db_port, output_dir=args.prev_dir,
+        )
+    elif args.daemon:
+        # 守护模式：双调度（每月1日 00:15 期初 + 每天 09:00 报表）
         schedule_loop(lambda a: run_once(a), args)
     else:
         run_once(args)
