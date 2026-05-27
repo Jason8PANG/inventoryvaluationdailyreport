@@ -30,6 +30,7 @@ services:
     # 所有配置通过 .env 注入（优先于 config.ini）
     environment:
       - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1      # 日志实时输出（避免 Docker 缓冲）
       # 邮件
       - MAIL_TO=${MAIL_TO}
       - MAIL_CC=${MAIL_CC}
