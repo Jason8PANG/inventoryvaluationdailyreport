@@ -1,0 +1,30 @@
+# ============================================================
+# config.ini — 可选后备配置（部署时复制为 config.ini）
+#
+# ⚠️  推荐所有配置写在 .env 文件中，config.ini 仅作为后备默认值。
+#     优先级：.env 环境变量 > config.ini > 代码内默认值
+# ============================================================
+
+[database]
+# 以下为代码内默认值，.env 优先
+# server   =
+# database = csi_datawarehouse
+# username =
+# password =
+prev_dir   = Previous Balance
+
+[email]
+# to =
+# cc =
+# from_addr = suzinventoryvaluationdailyreport@nai-group.com
+
+[smtp]
+# host     = mail.smtp2go.com
+# port     = 2525
+# user     =
+# password =
+tls      = true
+
+[infor]
+base_url = https://mingle-ionapi.inforcloudsuite.com
+tenant   = NAIGROUP_PRD

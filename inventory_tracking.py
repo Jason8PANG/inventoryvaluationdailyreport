@@ -34,6 +34,11 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
+import json
+import urllib.request
+import urllib.error
+import urllib.parse
+
 import pymssql
 import pandas as pd
 from openpyxl import Workbook
@@ -115,11 +120,11 @@ class ItemBalance:
 
     @property
     def balance(self) -> float:
-        return self.prev_balance + self.recv_amt - self.cons_amt - self.other_amt
+        return self.prev_balance + self.recv_amt + self.cons_amt + self.other_amt
 
     @property
     def net_qty(self) -> float:
-        return self.prev_qty + self.recv_qty - self.cons_qty - self.other_qty
+        return self.prev_qty + self.recv_qty + self.cons_qty + self.other_qty
 
 
 # ──────────────────────────────────────────────────────────────
@@ -316,7 +321,7 @@ class InventoryTracker:
         df["Item"] = df["Item"].astype(str).str.strip().str.upper()
         df = df[df["Item"] != "NAN"].copy()
         df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0)
-        df["TotalAmt"] = pd.to_numeric(df["TotalPosted"], errors="coerce").fillna(0).abs()
+        df["TotalAmt"] = pd.to_numeric(df["TotalPosted"], errors="coerce").fillna(0)
 
         # Currency conversion for non-USD sites
         if self.fx_rate != 1.0:
@@ -478,9 +483,9 @@ class InventoryTracker:
         data_start = 3
         data_end = ws_proj.max_row
         for r in range(data_start, data_end + 1):
-            ws_proj.cell(row=r, column=7, value=f"=B{r}+C{r}-D{r}-E{r}")
+            ws_proj.cell(row=r, column=7, value=f"=B{r}+C{r}+D{r}+E{r}")
             ws_proj.cell(row=r, column=7).number_format = "#,##0.00"
-            ws_proj.cell(row=r, column=8, value="4/30+Recv-Cons-Other")
+            ws_proj.cell(row=r, column=8, value="4/30+Recv+Cons+Other")
             ws_proj.cell(row=r, column=8).font = Font(size=9, color="666666")
             for col_idx in [2, 3, 4, 5, 6]:
                 ws_proj.cell(row=r, column=col_idx).number_format = "#,##0.00"
@@ -655,13 +660,13 @@ class InventoryTracker:
         recv_total = summary_df["Received_AMT"].sum()
         cons_total = summary_df["Consumed_AMT"].sum()
         other_total = summary_df["Other_AMT"].sum()
-        bal_total = prev_total + recv_total - cons_total - other_total
+        bal_total = prev_total + recv_total + cons_total + other_total
 
         print(f"\n  ┌─────────────────────────────────────────┐")
         print(f"  │  期初余额:   ${prev_total:>15,.2f}       │")
         print(f"  │  + Received: ${recv_total:>15,.2f}       │")
-        print(f"  │  - Consumed: ${cons_total:>15,.2f}       │")
-        print(f"  │  - Other:    ${other_total:>15,.2f}       │")
+        print(f"  │  + Consumed: ${cons_total:>15,.2f}       │")
+        print(f"  │  + Other:    ${other_total:>15,.2f}       │")
         print(f"  │  = Balance:  ${bal_total:>15,.2f}       │")
         print(f"  └─────────────────────────────────────────┘")
         print(f"\n✅ Site {self.site_ref} ({site_label}) 完成！")
@@ -745,17 +750,17 @@ def run_all_sites(
         print(f"\n  Site {s} ({SITE_NAMES.get(s, s)}):")
         print(f"    Items: {row['Items']:,}")
         print(f"    期初: ${row['Prev_Balance']:,.2f}  +Recv: ${row['Received_AMT']:,.2f}  "
-              f"-Cons: ${row['Consumed_AMT']:,.2f}  -Other: ${row['Other_AMT']:,.2f}  "
+              f"+Cons: ${row['Consumed_AMT']:,.2f}  +Other: ${row['Other_AMT']:,.2f}  "
               f"= ${row['Balance_AMT']:,.2f}")
 
     grand_prev = combined["Prev_Balance"].sum()
     grand_recv = combined["Received_AMT"].sum()
     grand_cons = combined["Consumed_AMT"].sum()
     grand_other = combined["Other_AMT"].sum()
-    grand_bal = grand_prev + grand_recv - grand_cons - grand_other
+    grand_bal = grand_prev + grand_recv + grand_cons + grand_other
     print(f"\n  🏢 ALL SITES Grand Total (USD):")
     print(f"    期初: ${grand_prev:,.2f}  +Recv: ${grand_recv:,.2f}  "
-          f"-Cons: ${grand_cons:,.2f}  -Other: ${grand_other:,.2f}  "
+          f"+Cons: ${grand_cons:,.2f}  +Other: ${grand_other:,.2f}  "
           f"= ${grand_bal:,.2f}")
 
     return {
@@ -786,7 +791,9 @@ def send_summary_email(
     combined = result["combined"]
 
     def fmt_num(v):
-        return f"${abs(v):,.2f}"
+        if v < 0:
+            return f"-${abs(v):,.2f}"
+        return f"${v:,.2f}"
 
     def proj_count(site):
         site_df = combined[combined["Site"] == site]
@@ -906,11 +913,341 @@ def send_summary_email(
 
 
 # ──────────────────────────────────────────────────────────────
-# 期初库存生成 — 从 SLItems 表生成下月期初余额文件
+# 期初库存生成 — 从 Infor CSI API 获取库存快照
 # ──────────────────────────────────────────────────────────────
 
+# Infor CSI API 站点参数配置
+# clmParam 格式：M,PMT,B,ABC,0,1,,,,,,,0,0,{site}
+# 取 PMTCode=P（Purchased Material）的 ABC 全等级，只含有库存品
+INFOR_API_BASE = "https://mingle-ionapi.inforcloudsuite.com"
+INFOR_TENANT = "NAIGROUP_PRD"
+INFOR_IDO = "SLItemCostingReport"
+INFOR_REPORT_PROC = "Rpt_ItemCostingSp"
+INFOR_PROPERTIES = "Item,Itemdesc,Prodcode,Units,Unitcost"
+
+# 每个站点的 clmParam 及 MongooseConfig header
+# 格式说明：M=制造 / PMT=采购类型 / B=选 / ABC=ABC分类 / 0,1=参数占位 / 最后参数=SiteRef
+SITE_API_CONFIG = {
+    "310": {
+        "clmParam": "M,PMT,B,ABC,0,1,,,,,,,0,0,310",
+        "mongoose_config": "NAIGROUP_PRD_310",
+    },
+    "330": {
+        "clmParam": "M,PMT,B,ABC,0,1,,,,,,,0,0,330",
+        "mongoose_config": "NAIGROUP_PRD_330",
+    },
+    "410": {
+        "clmParam": "M,PMT,B,ABC,0,1,,,,,,,0,0,410",
+        "mongoose_config": "NAIGROUP_PRD_410",
+    },
+}
+
+
+# ── Infor OAuth2 Token 缓存（模块级，进程生命周期内有效）────────
+_infor_token_cache: str | None = None
+_infor_token_expires_at: float = 0.0
+
+
+def _read_infor_config() -> dict:
+    """
+    从环境变量或 config.ini [infor] 节读取 OAuth2 配置。
+    优先级：环境变量 > config.ini > 代码内默认值
+    """
+    cfg = load_config()
+    if cfg.has_section("infor"):
+        infor_cfg = {k: v for k, v in cfg.items("infor") if k not in cfg.defaults()}
+    else:
+        infor_cfg = {}
+
+    def _env_or_ini(env_key, ini_key, default=""):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            return val
+        return infor_cfg.get(ini_key, default).strip()
+
+    return {
+        "token_url":   _env_or_ini("INFOR_TOKEN_URL", "token_url",
+                        f"https://mingle-sso.inforcloudsuite.com:443/{INFOR_TENANT}/as/token.oauth2"),
+        "auth_basic":  _env_or_ini("INFOR_AUTH_BASIC", "auth_basic", ""),
+        "username":    _env_or_ini("INFOR_USERNAME", "username", ""),
+        "password":    _env_or_ini("INFOR_PASSWORD", "password", ""),
+        "bearer_token": _env_or_ini("INFOR_BEARER_TOKEN", "bearer_token", ""),
+    }
+
+
+def _fetch_oauth_token(config: dict) -> tuple[str, int]:
+    """
+    发起 OAuth2 token 请求，返回 (access_token, expires_in)。
+    使用 urllib（不依赖 httpx），兼容 Docker 内的精简环境。
+    """
+    token_url = config["token_url"]
+    auth_basic = config["auth_basic"]
+    username = config["username"]
+    password = config["password"]
+
+    body = urllib.parse.urlencode({
+        "grant_type": "password",
+        "username": username,
+        "password": password,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        token_url,
+        data=body,
+        headers={
+            "Authorization": f"Basic {auth_basic}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"❌ OAuth2 Token 请求失败 (HTTP {e.code})\n"
+            f"   URL: {token_url}\n"
+            f"   响应: {err_body[:500]}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"❌ Token 端点网络连接失败: {e.reason}\n"
+            f"   URL: {token_url}\n"
+            f"   请检查 VPN 或网络连接"
+        ) from e
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"❌ Token 端点返回非 JSON: {e}\n"
+            f"   响应: {raw[:500]}"
+        ) from e
+
+    token = data.get("access_token")
+    if not token:
+        error = data.get("error", "unknown")
+        desc = data.get("error_description", "")
+        raise RuntimeError(
+            f"❌ Token 响应中无 access_token\n"
+            f"   error: {error}\n"
+            f"   description: {desc}"
+        )
+
+    expires_in = int(data.get("expires_in", 3600))
+    return token, expires_in
+
+
+def _load_infor_token(force_refresh: bool = False) -> str:
+    """
+    获取 Infor CSI API 的有效 access_token。
+
+    策略：
+      1. 如果有缓存 token 且未过期（提前 60s），直接返回
+      2. 读取 OAuth2 配置（Basic Auth + password grant）
+      3. POST token endpoint 获取新 token
+      4. 对 400/429/502/503/504 瞬时错误自动重试 3 次
+      5. 如果 OAuth2 配置缺失，降级使用手动 Bearer Token
+
+    force_refresh=True 时忽略缓存，强制重新获取（用于 401 重试场景）。
+    """
+    global _infor_token_cache, _infor_token_expires_at
+
+    # ── 检查缓存 ──
+    if not force_refresh and _infor_token_cache:
+        now = time.time()
+        if now < _infor_token_expires_at - 60:
+            return _infor_token_cache
+
+    # ── 读取配置 ──
+    config = _read_infor_config()
+
+    # ── 模式 A：OAuth2 password grant（推荐，自动刷新）──
+    if config["auth_basic"] and config["username"] and config["password"]:
+        print(f"  🔐 OAuth2 获取 Token: {config['token_url']}")
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                token, expires_in = _fetch_oauth_token(config)
+                _infor_token_cache = token
+                _infor_token_expires_at = time.time() + expires_in
+                print(f"  ✅ Token 获取成功，有效期 {expires_in}s")
+                return token
+            except urllib.error.HTTPError as e:
+                last_err = e
+                if e.code in (400, 429, 502, 503, 504):
+                    wait = 2 ** (attempt - 1)
+                    print(f"  ⚠️  Token 请求第 {attempt} 次失败 (HTTP {e.code})，{wait}s 后重试...")
+                    time.sleep(wait)
+                else:
+                    raise
+            except RuntimeError as e:
+                last_err = e
+                if attempt < 3:
+                    wait = 2 ** (attempt - 1)
+                    print(f"  ⚠️  Token 请求第 {attempt} 次异常：{e}")
+                    print(f"  ⏳ {wait}s 后重试...")
+                    time.sleep(wait)
+                else:
+                    break
+
+        raise RuntimeError(f"❌ OAuth2 Token 连续获取失败（3次重试）：{last_err}") from last_err
+
+    # ── 模式 B：手动 Bearer Token（降级，需要手动刷新）──
+    if config["bearer_token"]:
+        _infor_token_cache = config["bearer_token"]
+        _infor_token_expires_at = time.time() + 86400  # 手动 token 假设 24h 有效
+        print("  🔑 使用手动 Bearer Token（注意：过期需手动更新）")
+        return _infor_token_cache
+
+    raise RuntimeError(
+        "❌ 未找到 Infor API 认证凭据！\n"
+        "   请在以下任一位置配置 OAuth2 或手动 Token：\n"
+        "   ── 推荐：OAuth2 password grant（自动刷新，无需手动维护 Token）──\n"
+        "   A) .env 文件加入：\n"
+        "      INFOR_AUTH_BASIC=<Base64(client_id:client_secret)>\n"
+        "      INFOR_USERNAME=<infor_username>\n"
+        "      INFOR_PASSWORD=<infor_password>\n"
+        "   B) config.ini [infor] 节加入：\n"
+        "      auth_basic = <Base64(client_id:client_secret)>\n"
+        "      username = <infor_username>\n"
+        "      password = <infor_password>\n"
+        "   ── 备选：手动 Bearer Token（需手动更新，不推荐）──\n"
+        "   C) .env 文件加入：INFOR_BEARER_TOKEN=<token>\n"
+        "   D) config.ini [infor] bearer_token = <token>\n"
+        "   ── 获取 OAuth2 凭据 ──\n"
+        "   1. client_id / client_secret：联系 Infor 管理员或从 csi_datawarehouse .env 获取\n"
+        "   2. INFOR_AUTH_BASIC = Base64(client_id:client_secret)\n"
+        "      Linux: echo -n 'client_id:client_secret' | base64\n"
+        "      Python: base64.b64encode(b'client_id:client_secret').decode()\n"
+    )
+
+
+def _fetch_infor_site(site_ref: str, token: str, token_expired_retry: bool = False) -> pd.DataFrame:
+    """
+    调用 Infor CSI IDO API 获取指定站点的库存成本报告（Purchased Material）。
+    返回 DataFrame，列：Item, Itemdesc, Prodcode, Units, Unitcost
+
+    token_expired_retry=True 时表示已在重试中，不再重试 401。
+    """
+    site_cfg = SITE_API_CONFIG[site_ref]
+    clm_param = urllib.parse.quote(site_cfg["clmParam"], safe="")
+    url = (
+        f"{INFOR_API_BASE}/{INFOR_TENANT}/CSI/IDORequestService/ido/load/{INFOR_IDO}"
+        f"?clm={INFOR_REPORT_PROC}"
+        f"&properties={INFOR_PROPERTIES}"
+        f"&clmParam={clm_param}"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Infor-MongooseConfig": site_cfg["mongoose_config"],
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    print(f"  🌐 调用 Infor API: Site {site_ref} ({site_cfg['mongoose_config']})...")
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        if e.code == 401 and not token_expired_retry:
+            # Token 过期 → 强制刷新后重试一次
+            print(f"  🔄 Site {site_ref}: Token 过期 (401)，强制刷新...")
+            new_token = _load_infor_token(force_refresh=True)
+            return _fetch_infor_site(site_ref, new_token, token_expired_retry=True)
+        elif e.code == 401:
+            raise RuntimeError(
+                f"❌ Infor API 认证失败 (401) - Site {site_ref}\n"
+                f"   Token 刷新后仍然无效，请检查 OAuth2 凭据"
+            ) from e
+        elif e.code == 502:
+            raise RuntimeError(
+                f"❌ Infor API 502 Bad Gateway - Site {site_ref}\n"
+                f"   可能原因：VPN 未连接、Infor CloudSuite 服务暂时不可用\n"
+                f"   响应：{body[:300]}"
+            ) from e
+        else:
+            raise RuntimeError(
+                f"❌ Infor API HTTP {e.code} - Site {site_ref}\n"
+                f"   响应：{body[:300]}"
+            ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"❌ 网络连接失败 - Site {site_ref}: {e.reason}\n"
+            f"   请检查 VPN 或网络连接"
+        ) from e
+
+    # 解析 JSON
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"❌ Infor API 返回非 JSON 内容 - Site {site_ref}: {e}\n"
+            f"   原始响应前 500 字符：{raw[:500]}"
+        ) from e
+
+    # IDO 响应格式：{"Items": {"Items": [{"PropValue": [v1, v2, ...]}, ...]}}
+    # 或：{"Items": [{"PropValue": [v1, v2, ...]}, ...]}
+    rows = []
+    props = INFOR_PROPERTIES.split(",")
+
+    try:
+        item_list = data.get("Items", {})
+        if isinstance(item_list, dict):
+            item_list = item_list.get("Items", [])
+        if not isinstance(item_list, list):
+            raise ValueError(f"响应结构异常，Items 不是列表: {type(item_list)}")
+
+        for record in item_list:
+            values = record.get("PropValue", [])
+            if len(values) < len(props):
+                values += [""] * (len(props) - len(values))
+            row = dict(zip(props, values))
+            rows.append(row)
+
+    except Exception as e:
+        raise RuntimeError(
+            f"❌ Infor API 响应解析失败 - Site {site_ref}: {e}\n"
+            f"   响应结构：{str(data)[:500]}"
+        ) from e
+
+    df = pd.DataFrame(rows, columns=props)
+    print(f"  ✅ Site {site_ref}: API 返回 {len(df)} 条记录")
+
+    if df.empty:
+        print(f"  ⚠️  Site {site_ref}: 未返回数据（可能 clmParam 参数有误或站点无采购物料）")
+        return pd.DataFrame(columns=["Item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"])
+
+    # 列名标准化（对应 load_previous_balance 所期望的格式）
+    df = df.rename(columns={
+        "Item":     "Item",
+        "Itemdesc": "Description",
+        "Prodcode": "ProductCode",
+        "Units":    "Per",        # 在库数量 (OnHand equivalent)
+        "Unitcost": "Unitcost",   # 单价
+    })
+
+    df["Item"] = df["Item"].astype(str).str.strip().str.upper()
+    df["Description"] = df["Description"].astype(str).str.strip()
+    df["ProductCode"] = df["ProductCode"].astype(str).str.strip()
+    df["Per"] = pd.to_numeric(df["Per"], errors="coerce").fillna(0)
+    df["Unitcost"] = pd.to_numeric(df["Unitcost"], errors="coerce").fillna(0)
+
+    # 只保留有库存数量的行（等同于原 SQL 中 OnHand <> 0）
+    df = df[df["Per"] != 0].copy()
+    df["Sourcing"] = "Purchased"
+
+    return df[["Item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]]
+
+
 def _db_connect(server, username, password, database, port=1433):
-    """独立的数据库连接函数（供非 Tracker 场景使用）"""
+    """独立的数据库连接函数（供 generate_opening_balance SQL fallback 使用）"""
     host = server
     instance = None
     if "\\" in host:
@@ -925,34 +1262,23 @@ def _db_connect(server, username, password, database, port=1433):
         login_timeout=15,
         conn_properties="SET TEXTSIZE 65536",
     )
-    if instance:
-        # 命名实例时不指定端口，由 SQL Browser 解析
-        kwargs["server"] = f"{host}\\{instance}"
-    else:
+    if not instance:
         kwargs["port"] = port
 
     return pymssql.connect(**kwargs)
 
 
-def generate_opening_balance(server, username, password, database, port=1433,
-                             output_dir="Previous Balance"):
+def _fetch_opening_via_sql(server, username, password, database, port=1433) -> pd.DataFrame:
     """
-    从 SLItems 表读取各站点当前库存快照，生成本月期初余额 Excel 文件。
-    文件写入 output_dir/site XXX.xlsx，供日常报表读取。
-    仅导出 PMTCode='P'（采购物料），与日常报表口径一致。
+    SQL Fallback：直接查询 SLItems 表获取库存快照。
+    仅在 Infor API 不可用时调用。
     """
-    print("=" * 60)
-    print("  生成期初库存余额文件 (SLItems Snapshot)")
-    print("=" * 60)
-
     conn = _db_connect(server, username, password, database, port)
     query = """
         SELECT SiteRef,
                item,
                Description,
-               CASE PMTCode WHEN 'P' THEN 'Purchased'
-                            WHEN 'M' THEN 'Manufactured'
-                            ELSE 'Other' END AS Sourcing,
+               'Purchased' AS Sourcing,
                ProductCode,
                OnHand AS Per,
                DerUnitCost AS Unitcost
@@ -962,49 +1288,132 @@ def generate_opening_balance(server, username, password, database, port=1433,
           AND OnHand <> 0
         ORDER BY SiteRef, ProductCode, item
     """
-
     df = pd.read_sql(query, conn)
     conn.close()
+    return df
 
-    if df.empty:
-        print("  ⚠️ 未查询到任何数据")
-        return
 
-    # 确保输出目录存在
+def generate_opening_balance(
+    server=None, username=None, password=None, database=None, port=1433,
+    output_dir="Previous Balance",
+    use_api: bool = True,
+):
+    """
+    生成期初库存余额 Excel 文件（一个站点一个文件）。
+    文件写入 output_dir/site XXX.xlsx，供日常报表读取。
+    仅含 PMTCode='P'（采购物料），与日常报表口径一致。
+
+    数据来源优先级：
+      1. Infor CSI API（use_api=True，默认）：调用 SLItemCostingReport IDO
+      2. SQL Fallback（use_api=False 或 API 失败时）：直接查询 SLItems 表
+
+    参数：
+      server/username/password/database/port — SQL fallback 用的数据库连接参数
+      output_dir — Excel 文件输出目录
+      use_api    — 是否优先使用 Infor CSI API（默认 True）
+    """
+    print("=" * 60)
+    print("  生成期初库存余额文件")
+    print("=" * 60)
+
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    site_info = {
-        "310": "Plant1",
-        "330": "Plant2",
-        "410": "PNG",
-    }
+    site_info = {"310": "Plant1", "330": "Plant2", "410": "PNG"}
+    sites = ["310", "330", "410"]
 
-    results = []
-    for site_ref, group in df.groupby("SiteRef"):
-        label = site_info.get(site_ref, site_ref)
-        fname = out_path / f"site {site_ref}.xlsx"
+    # ── 尝试从 Infor CSI API 获取数据 ──
+    if use_api:
+        try:
+            token = _load_infor_token()
+        except RuntimeError as e:
+            print(f"  {e}")
+            print("  ⚠️  将降级使用 SQL 直连方式...")
+            use_api = False
 
-        export_df = group[["item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]].copy()
-        export_df.columns = ["Item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]
-        export_df["Item"] = export_df["Item"].astype(str).str.strip().str.upper()
-        export_df.to_excel(fname, index=False, sheet_name="Opening Balance")
+    if use_api:
+        print("  📡 数据来源：Infor CSI API")
+        results = []
+        api_failed_sites = []
 
-        total_items = len(export_df)
-        total_value = (pd.to_numeric(export_df["Per"], errors="coerce").fillna(0) *
-                       pd.to_numeric(export_df["Unitcost"], errors="coerce").fillna(0)).sum()
+        for site_ref in sites:
+            try:
+                df = _fetch_infor_site(site_ref, token)
+            except RuntimeError as e:
+                print(f"  ❌ Site {site_ref} API 调用失败：{e}")
+                api_failed_sites.append(site_ref)
+                continue
 
-        print(f"  ✅ Site {site_ref} ({label}): {total_items} items, 金额: ${total_value:,.2f}")
-        print(f"     → {fname}")
-        results.append({
-            "site": site_ref, "label": label,
-            "items": total_items, "value": total_value,
-        })
+            if df.empty:
+                api_failed_sites.append(site_ref)
+                continue
+
+            _write_opening_excel(df, site_ref, out_path, site_info, results)
+
+        # 对 API 失败的站点尝试 SQL fallback
+        if api_failed_sites and server:
+            print(f"\n  ↩️  以下站点将使用 SQL fallback：{api_failed_sites}")
+            try:
+                fallback_df = _fetch_opening_via_sql(server, username, password, database, port)
+                for site_ref in api_failed_sites:
+                    site_df = fallback_df[fallback_df["SiteRef"] == site_ref].copy()
+                    site_df = site_df[["item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]].copy()
+                    site_df.columns = ["Item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]
+                    site_df["Item"] = site_df["Item"].astype(str).str.strip().str.upper()
+                    _write_opening_excel(site_df, site_ref, out_path, site_info, results)
+            except Exception as e:
+                print(f"  ❌ SQL fallback 也失败：{e}")
+        elif api_failed_sites:
+            print(f"  ⚠️  以下站点无法获取数据（无 SQL fallback 配置）：{api_failed_sites}")
+
+    else:
+        # 纯 SQL 模式
+        print("  🗄️  数据来源：SQL Server SLItems 表")
+        if not server:
+            print("  ❌ SQL 模式需要数据库连接参数（server/username/password/database）")
+            return None
+
+        try:
+            fallback_df = _fetch_opening_via_sql(server, username, password, database, port)
+        except Exception as e:
+            print(f"  ❌ SQL 查询失败：{e}")
+            return None
+
+        results = []
+        for site_ref in sites:
+            site_df = fallback_df[fallback_df["SiteRef"] == site_ref].copy()
+            site_df = site_df[["item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]].copy()
+            site_df.columns = ["Item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]
+            site_df["Item"] = site_df["Item"].astype(str).str.strip().str.upper()
+            _write_opening_excel(site_df, site_ref, out_path, site_info, results)
+
+    if not results:
+        print("  ⚠️ 所有站点均未能获取数据")
+        return None
 
     grand = sum(r["value"] for r in results)
     print(f"\n  📊 总计: {sum(r['items'] for r in results)} items, Grand Total: ${grand:,.2f}")
     print(f"  📁 文件目录: {out_path.resolve()}")
     return results
+
+
+def _write_opening_excel(df: pd.DataFrame, site_ref: str, out_path: Path,
+                          site_info: dict, results: list) -> None:
+    """将单站点期初数据写入 Excel 并追加到 results 列表"""
+    label = site_info.get(site_ref, site_ref)
+    fname = out_path / f"site {site_ref}.xlsx"
+
+    df.to_excel(fname, index=False, sheet_name="Opening Balance")
+
+    total_items = len(df)
+    total_value = (
+        pd.to_numeric(df["Per"], errors="coerce").fillna(0) *
+        pd.to_numeric(df["Unitcost"], errors="coerce").fillna(0)
+    ).sum()
+
+    print(f"  ✅ Site {site_ref} ({label}): {total_items} items, 金额: ${total_value:,.2f}")
+    print(f"     → {fname}")
+    results.append({"site": site_ref, "label": label, "items": total_items, "value": total_value})
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1051,7 +1460,7 @@ def _next_schedule(now):
 def schedule_loop(run_func, args):
     """
     双调度守护进程：
-      - 每月1日 00:15：自动生成期初库存文件（从 SLItems 快照）
+      - 每月1日 00:15：自动生成期初库存文件（优先 Infor CSI API，降级 SQL）
       - 每天 09:00：运行库存跟踪报表 + 发邮件
     Docker 停止时收到 SIGTERM 自然退出。
     """
@@ -1059,6 +1468,7 @@ def schedule_loop(run_func, args):
         server=args.server, username=args.username,
         password=args.password, database=args.database,
         port=args.db_port, output_dir=args.prev_dir,
+        use_api=True,
     )
 
     print(f"⏰ Daemon mode started:")
@@ -1176,7 +1586,8 @@ def main():
     parser.add_argument("-f", "--prev-file", help="单站点期初余额Excel路径")
     parser.add_argument("--all-sites", action="store_true", help="批量运行310/330/410")
     parser.add_argument("--daemon", action="store_true", help="守护模式：每月1日 00:15 生成期初 + 每天 09:00 跑报表")
-    parser.add_argument("--generate-opening", action="store_true", help="手动从 SLItems 生成期初库存文件（不跑报表）")
+    parser.add_argument("--generate-opening", action="store_true", help="手动生成期初库存文件（优先 Infor CSI API，降级 SQL）")
+    parser.add_argument("--no-api", action="store_true", help="生成期初时强制使用 SQL 模式（跳过 Infor CSI API）")
     parser.add_argument("--prev-dir", default=db_sec.get("prev_dir", "Previous Balance"))
     parser.add_argument("--output-dir", default=db_sec.get("output_dir", None))
     parser.add_argument("-o", "--output", help="输出文件名 (单站点模式)")
@@ -1203,11 +1614,12 @@ def main():
     args = parser.parse_args()
 
     if args.generate_opening:
-        # 手动生成期初模式
+        # 手动生成期初模式（优先 Infor CSI API，降级 SQL）
         generate_opening_balance(
             server=args.server, username=args.username,
             password=args.password, database=args.database,
             port=args.db_port, output_dir=args.prev_dir,
+            use_api=not args.no_api,
         )
     elif args.daemon:
         # 守护模式：双调度（每月1日 00:15 期初 + 每天 09:00 报表）
@@ -1217,4 +1629,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # ── 加载 .env 到环境变量（优先于 config.ini）──
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
     main()

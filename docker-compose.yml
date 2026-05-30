@@ -4,7 +4,8 @@
 # 使用方式：
 #   docker compose build       # 构建镜像
 #   docker compose up -d       # 启动守护进程
-#     - 每月1日 00:15 自动从 SLItems 生成期初库存文件
+#     - 每月1日 00:15 自动从 Infor CSI API 生成期初库存文件
+#       (API 不可用时降级为 SQL 直连 SLItems 表)
 #     - 每天 09:00 自动运行库存报表并发送邮件
 #   docker compose logs -f     # 查看日志
 #   docker compose down        # 停止（调度随之停止）
@@ -43,12 +44,24 @@ services:
       - SMTP_USER=${SMTP_USER}
       - SMTP_PASSWORD=${SMTP_PASSWORD}
       - SMTP_TLS=${SMTP_TLS}
-      # 数据库
+      # 数据库（SQL fallback 用）
       - SQL_SERVER_HOST=${SQL_SERVER_HOST}
       - SQL_SERVER_PORT=${SQL_SERVER_PORT}
       - SQL_SERVER_DATABASE=${SQL_SERVER_DATABASE}
       - SQL_SERVER_USERNAME=${SQL_SERVER_USERNAME}
       - SQL_SERVER_PASSWORD=${SQL_SERVER_PASSWORD}
+      # Infor CSI API — 期初库存抓取（OAuth2 自动获取 Token）
+      # 推荐配置 OAuth2 凭据（与 csi_datawarehouse 共用）：
+      #   INFOR_AUTH_BASIC = Base64(client_id:client_secret)
+      #   INFOR_USERNAME = Infor 用户名
+      #   INFOR_PASSWORD = Infor 密码
+      - INFOR_AUTH_BASIC=${INFOR_AUTH_BASIC}
+      - INFOR_USERNAME=${INFOR_USERNAME}
+      - INFOR_PASSWORD=${INFOR_PASSWORD}
+      # Token 端点（留空则自动构造）
+      - INFOR_TOKEN_URL=${INFOR_TOKEN_URL}
+      # 降级：手动 Bearer Token（不推荐，OAuth2 凭据已配置时可忽略）
+      - INFOR_BEARER_TOKEN=${INFOR_BEARER_TOKEN}
 
     networks:
       - public-net
