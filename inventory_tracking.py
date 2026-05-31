@@ -221,7 +221,8 @@ class InventoryTracker:
             qty_col, amt_col = "Prev_Qty", "Prev_Balance"
             calc_extended = False
         elif "Per" in df.columns and "Unitscost" in df.columns:
-            # 旧Infor格式：Unitscost 是扩展成本
+            # Infor API 格式：Unitscost 是扩展金额（= Units × Unitcost，由 API 直接提供）
+            # Prev_Balance 直接使用 Unitscost，无需计算
             qty_col, amt_col = "Per", "Unitscost"
             calc_extended = False
         elif "Per" in df.columns and "Unitcost" in df.columns:
@@ -910,7 +911,7 @@ INFOR_API_BASE = "https://mingle-ionapi.inforcloudsuite.com"
 INFOR_TENANT = "NAIGROUP_PRD"
 INFOR_IDO = "SLItemCostingReport"
 INFOR_REPORT_PROC = "Rpt_ItemCostingSp"
-INFOR_PROPERTIES = "Item,Itemdesc,Prodcode,Units,Unitcost"
+INFOR_PROPERTIES = "Item,Itemdesc,Units,Unitcost,Unitscost"
 
 # 每个站点的 clmParam 及 MongooseConfig header
 # 格式说明：M=制造 / PMT=采购类型 / B=选 / ABC=ABC分类 / 0,1=参数占位 / 最后参数=SiteRef
@@ -1194,28 +1195,27 @@ def _fetch_infor_site(site_ref: str, token: str, token_expired_retry: bool = Fal
 
     if df.empty:
         print(f"  ⚠️  Site {site_ref}: 未返回数据（可能 clmParam 参数有误或站点无采购物料）")
-        return pd.DataFrame(columns=["Item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"])
+        return pd.DataFrame(columns=["Item", "Description", "Per", "Unitcost", "Unitscost"])
 
-    # 列名标准化（对应 load_previous_balance 所期望的格式）
+    # 列名标准化
+    # Units   → Per       (库存数量)
+    # Unitcost → Unitcost  (标准单价，保留原名)
+    # Unitscost → Unitscost (扩展金额 = Units × Unitcost，API 直接提供，无需计算)
     df = df.rename(columns={
-        "Item":     "Item",
-        "Itemdesc": "Description",
-        "Prodcode": "ProductCode",
-        "Units":    "Per",        # 在库数量 (OnHand equivalent)
-        "Unitcost": "Unitcost",   # 单价
+        "Itemdesc":  "Description",
+        "Units":     "Per",
     })
 
-    df["Item"] = df["Item"].astype(str).str.strip().str.upper()
+    df["Item"]      = df["Item"].astype(str).str.strip().str.upper()
     df["Description"] = df["Description"].astype(str).str.strip()
-    df["ProductCode"] = df["ProductCode"].astype(str).str.strip()
-    df["Per"] = pd.to_numeric(df["Per"], errors="coerce").fillna(0)
-    df["Unitcost"] = pd.to_numeric(df["Unitcost"], errors="coerce").fillna(0)
+    df["Per"]       = pd.to_numeric(df["Per"],       errors="coerce").round(8).fillna(0)
+    df["Unitcost"]  = pd.to_numeric(df["Unitcost"],  errors="coerce").round(8).fillna(0)
+    df["Unitscost"] = pd.to_numeric(df["Unitscost"], errors="coerce").round(8).fillna(0)
 
-    # 只保留有库存数量的行（等同于原 SQL 中 OnHand <> 0）
-    df = df[df["Per"] != 0].copy()
-    df["Sourcing"] = "Purchased"
+    # 只保留有扩展金额的行（Unitscost != 0）
+    df = df[df["Unitscost"] != 0].copy()
 
-    return df[["Item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]]
+    return df[["Item", "Description", "Per", "Unitcost", "Unitscost"]]
 
 
 def _db_connect(server, username, password, database, port=1433):
@@ -1240,6 +1240,52 @@ def _db_connect(server, username, password, database, port=1433):
     return pymssql.connect(**kwargs)
 
 
+def _enrich_with_slitems(df: pd.DataFrame, site_ref: str,
+                          server, username, password, database, port=1433) -> pd.DataFrame:
+    """
+    从 SLItems 表按 Item + SiteRef 关联补充项目信息。
+    补充字段：ProductCode, Sourcing（PMTCode）
+    若数据库不可用，则以空值填充（不阻断主流程）。
+    """
+    if df.empty:
+        return df
+
+    items = df["Item"].dropna().unique().tolist()
+    if not items:
+        return df
+
+    try:
+        conn = _db_connect(server, username, password, database, port)
+        placeholders = ",".join(["%s"] * len(items))
+        query = f"""
+            SELECT UPPER(LTRIM(RTRIM(item))) AS Item,
+                   ProductCode,
+                   PMTCode AS Sourcing
+            FROM [csi_datawarehouse].[dbo].[SLItems]
+            WHERE SiteRef = %s
+              AND UPPER(LTRIM(RTRIM(item))) IN ({placeholders})
+        """
+        params = [site_ref] + items
+        ref_df = pd.read_sql(query, conn, params=params)
+        conn.close()
+
+        ref_df["Item"] = ref_df["Item"].astype(str).str.strip().str.upper()
+        ref_df["ProductCode"] = ref_df["ProductCode"].astype(str).str.strip()
+        ref_df["Sourcing"] = ref_df["Sourcing"].astype(str).str.strip()
+        ref_df = ref_df.drop_duplicates(subset="Item")
+
+        df = df.merge(ref_df[["Item", "ProductCode", "Sourcing"]], on="Item", how="left")
+        df["ProductCode"] = df["ProductCode"].fillna("")
+        df["Sourcing"] = df["Sourcing"].fillna("Unknown")
+        print(f"  🔗 Site {site_ref}: SLItems 关联成功，{len(ref_df)} 条记录匹配")
+    except Exception as e:
+        print(f"  ⚠️  Site {site_ref}: SLItems 关联失败（{e}），ProductCode/Sourcing 将为空")
+        df["ProductCode"] = ""
+        df["Sourcing"] = ""
+
+    return df
+
+
 def _fetch_opening_via_sql(server, username, password, database, port=1433) -> pd.DataFrame:
     """
     SQL Fallback：直接查询 SLItems 表获取库存快照。
@@ -1252,8 +1298,9 @@ def _fetch_opening_via_sql(server, username, password, database, port=1433) -> p
                Description,
                'Purchased' AS Sourcing,
                ProductCode,
-               OnHand AS Per,
-               DerUnitCost AS Unitcost
+               CAST(OnHand AS DECIMAL(20,8)) AS Per,
+               CAST(DerUnitCost AS DECIMAL(20,8)) AS Unitcost,
+               CAST(OnHand * DerUnitCost AS DECIMAL(20,8)) AS Unitscost
         FROM [csi_datawarehouse].[dbo].[SLItems]
         WHERE SiteRef IN ('310', '330', '410')
           AND PMTCode = 'P'
@@ -1320,6 +1367,13 @@ def generate_opening_balance(
                 api_failed_sites.append(site_ref)
                 continue
 
+            # 从 SLItems 关联 ProductCode / Sourcing
+            if server:
+                df = _enrich_with_slitems(df, site_ref, server, username, password, database, port)
+            else:
+                df["ProductCode"] = ""
+                df["Sourcing"] = ""
+
             _write_opening_excel(df, site_ref, out_path, site_info, results)
 
         # 对 API 失败的站点尝试 SQL fallback
@@ -1329,8 +1383,8 @@ def generate_opening_balance(
                 fallback_df = _fetch_opening_via_sql(server, username, password, database, port)
                 for site_ref in api_failed_sites:
                     site_df = fallback_df[fallback_df["SiteRef"] == site_ref].copy()
-                    site_df = site_df[["item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]].copy()
-                    site_df.columns = ["Item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]
+                    site_df = site_df[["item", "Description", "Per", "Unitcost", "Unitscost", "ProductCode", "Sourcing"]].copy()
+                    site_df.columns = ["Item", "Description", "Per", "Unitcost", "Unitscost", "ProductCode", "Sourcing"]
                     site_df["Item"] = site_df["Item"].astype(str).str.strip().str.upper()
                     _write_opening_excel(site_df, site_ref, out_path, site_info, results)
             except Exception as e:
@@ -1354,8 +1408,8 @@ def generate_opening_balance(
         results = []
         for site_ref in sites:
             site_df = fallback_df[fallback_df["SiteRef"] == site_ref].copy()
-            site_df = site_df[["item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]].copy()
-            site_df.columns = ["Item", "Description", "Per", "Unitcost", "ProductCode", "Sourcing"]
+            site_df = site_df[["item", "Description", "Per", "Unitcost", "Unitscost", "ProductCode", "Sourcing"]].copy()
+            site_df.columns = ["Item", "Description", "Per", "Unitcost", "Unitscost", "ProductCode", "Sourcing"]
             site_df["Item"] = site_df["Item"].astype(str).str.strip().str.upper()
             _write_opening_excel(site_df, site_ref, out_path, site_info, results)
 
@@ -1375,13 +1429,22 @@ def _write_opening_excel(df: pd.DataFrame, site_ref: str, out_path: Path,
     label = site_info.get(site_ref, site_ref)
     fname = out_path / f"site {site_ref}.xlsx"
 
+    # 数值列统一保留 8 位小数
+    for col in ["Per", "Unitcost", "Unitscost"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(8)
+
     df.to_excel(fname, index=False, sheet_name="Opening Balance")
 
     total_items = len(df)
-    total_value = (
-        pd.to_numeric(df["Per"], errors="coerce").fillna(0) *
-        pd.to_numeric(df["Unitcost"], errors="coerce").fillna(0)
-    ).sum()
+    # 直接用 Unitscost（扩展金额）列求和；fallback 到 Per × Unitcost
+    if "Unitscost" in df.columns:
+        total_value = pd.to_numeric(df["Unitscost"], errors="coerce").fillna(0).sum()
+    else:
+        total_value = (
+            pd.to_numeric(df.get("Per", 0), errors="coerce").fillna(0) *
+            pd.to_numeric(df.get("Unitcost", 0), errors="coerce").fillna(0)
+        ).sum()
 
     print(f"  ✅ Site {site_ref} ({label}): {total_items} items, 金额: ${total_value:,.2f}")
     print(f"     → {fname}")
