@@ -11,10 +11,10 @@
 6. 导出Excel报表（Project Summary + Summary + Detail 三页，Project Summary 在前）
 7. 支持多站点（310/330/410）批量运行
 8. 通过 SMTP 发送邮件（支持内网 Relay，无需 Outlook）
-9. 通过 config.ini 外部化配置（DB、SMTP、邮件收件人）
+9. 通过 .env 外部化配置（DB、SMTP、邮件收件人、Infor API）
 
 作者: WorkBuddy for NAI Group
-日期: 2026-05-25 | 更新: 2026-05-27 (pymssql + SMTP + config.ini + 自动期初生成)
+日期: 2026-05-25 | 更新: 2026-05-31 (移除 config.ini，统一用 .env 配置)
 """
 
 import os
@@ -23,7 +23,6 @@ import time
 import glob
 import warnings
 import argparse
-import configparser
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -45,18 +44,6 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, numbers
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.utils import get_column_letter
-
-
-# ──────────────────────────────────────────────────────────────
-# 读取 config.ini（如存在）
-# ──────────────────────────────────────────────────────────────
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
-
-def load_config() -> configparser.ConfigParser:
-    cfg = configparser.ConfigParser()
-    if os.path.exists(CONFIG_FILE):
-        cfg.read(CONFIG_FILE, encoding="utf-8")
-    return cfg
 
 
 # ──────────────────────────────────────────────────────────────
@@ -950,28 +937,19 @@ _infor_token_expires_at: float = 0.0
 
 def _read_infor_config() -> dict:
     """
-    从环境变量或 config.ini [infor] 节读取 OAuth2 配置。
-    优先级：环境变量 > config.ini > 代码内默认值
+    从环境变量读取 OAuth2 配置。
+    优先级：环境变量 > 代码内默认值
     """
-    cfg = load_config()
-    if cfg.has_section("infor"):
-        infor_cfg = {k: v for k, v in cfg.items("infor") if k not in cfg.defaults()}
-    else:
-        infor_cfg = {}
-
-    def _env_or_ini(env_key, ini_key, default=""):
-        val = os.environ.get(env_key, "").strip()
-        if val:
-            return val
-        return infor_cfg.get(ini_key, default).strip()
+    def _env(env_key, default=""):
+        return os.environ.get(env_key, "").strip() or default
 
     return {
-        "token_url":   _env_or_ini("INFOR_TOKEN_URL", "token_url",
-                        f"https://mingle-sso.inforcloudsuite.com:443/{INFOR_TENANT}/as/token.oauth2"),
-        "auth_basic":  _env_or_ini("INFOR_AUTH_BASIC", "auth_basic", ""),
-        "username":    _env_or_ini("INFOR_USERNAME", "username", ""),
-        "password":    _env_or_ini("INFOR_PASSWORD", "password", ""),
-        "bearer_token": _env_or_ini("INFOR_BEARER_TOKEN", "bearer_token", ""),
+        "token_url":    _env("INFOR_TOKEN_URL",
+                             f"https://mingle-sso.inforcloudsuite.com:443/{INFOR_TENANT}/as/token.oauth2"),
+        "auth_basic":   _env("INFOR_AUTH_BASIC"),
+        "username":     _env("INFOR_USERNAME"),
+        "password":     _env("INFOR_PASSWORD"),
+        "bearer_token": _env("INFOR_BEARER_TOKEN"),
     }
 
 
@@ -1104,19 +1082,13 @@ def _load_infor_token(force_refresh: bool = False) -> str:
 
     raise RuntimeError(
         "❌ 未找到 Infor API 认证凭据！\n"
-        "   请在以下任一位置配置 OAuth2 或手动 Token：\n"
+        "   请在 .env 文件中配置 OAuth2 凭据：\n"
         "   ── 推荐：OAuth2 password grant（自动刷新，无需手动维护 Token）──\n"
-        "   A) .env 文件加入：\n"
-        "      INFOR_AUTH_BASIC=<Base64(client_id:client_secret)>\n"
-        "      INFOR_USERNAME=<infor_username>\n"
-        "      INFOR_PASSWORD=<infor_password>\n"
-        "   B) config.ini [infor] 节加入：\n"
-        "      auth_basic = <Base64(client_id:client_secret)>\n"
-        "      username = <infor_username>\n"
-        "      password = <infor_password>\n"
+        "   INFOR_AUTH_BASIC=<Base64(client_id:client_secret)>\n"
+        "   INFOR_USERNAME=<infor_username>\n"
+        "   INFOR_PASSWORD=<infor_password>\n"
         "   ── 备选：手动 Bearer Token（需手动更新，不推荐）──\n"
-        "   C) .env 文件加入：INFOR_BEARER_TOKEN=<token>\n"
-        "   D) config.ini [infor] bearer_token = <token>\n"
+        "   INFOR_BEARER_TOKEN=<token>\n"
         "   ── 获取 OAuth2 凭据 ──\n"
         "   1. client_id / client_secret：联系 Infor 管理员或从 csi_datawarehouse .env 获取\n"
         "   2. INFOR_AUTH_BASIC = Base64(client_id:client_secret)\n"
@@ -1551,12 +1523,6 @@ def run_once(args):
 # CLI
 # ──────────────────────────────────────────────────────────────
 def main():
-    # 读取 config.ini 作为默认值
-    cfg = load_config()
-    db_sec = cfg["database"] if "database" in cfg else {}
-    mail_sec = cfg["email"] if "email" in cfg else {}
-    smtp_sec = cfg["smtp"] if "smtp" in cfg else {}
-
     parser = argparse.ArgumentParser(
         description="库存金额跟踪系统（pymssql + SMTP）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1576,11 +1542,11 @@ def main():
         """,
     )
     # 数据库
-    parser.add_argument("-s", "--server",   default=os.environ.get("SQL_SERVER_HOST") or db_sec.get("server", r"SUZVPRINT01\CUSTOMSSYS"))
-    parser.add_argument("-d", "--database", default=os.environ.get("SQL_SERVER_DATABASE") or db_sec.get("database", "csi_datawarehouse"))
-    parser.add_argument("-u", "--username", default=os.environ.get("SQL_SERVER_USERNAME") or db_sec.get("username", "sa"))
-    parser.add_argument("-p", "--password", default=os.environ.get("SQL_SERVER_PASSWORD") or db_sec.get("password", "xxVcDW9ED24YWX"))
-    parser.add_argument("--db-port", type=int, default=int(os.environ.get("SQL_SERVER_PORT") or db_sec.get("port", 1433)))
+    parser.add_argument("-s", "--server",   default=os.environ.get("SQL_SERVER_HOST",     r"SUZVPRINT01\CUSTOMSSYS"))
+    parser.add_argument("-d", "--database", default=os.environ.get("SQL_SERVER_DATABASE", "csi_datawarehouse"))
+    parser.add_argument("-u", "--username", default=os.environ.get("SQL_SERVER_USERNAME", "sa"))
+    parser.add_argument("-p", "--password", default=os.environ.get("SQL_SERVER_PASSWORD", ""))
+    parser.add_argument("--db-port", type=int, default=int(os.environ.get("SQL_SERVER_PORT", 1433)))
     # 模式
     parser.add_argument("--site", default="310", help="单站点模式 (默认310)")
     parser.add_argument("-f", "--prev-file", help="单站点期初余额Excel路径")
@@ -1588,28 +1554,24 @@ def main():
     parser.add_argument("--daemon", action="store_true", help="守护模式：每月1日 00:15 生成期初 + 每天 09:00 跑报表")
     parser.add_argument("--generate-opening", action="store_true", help="手动生成期初库存文件（优先 Infor CSI API，降级 SQL）")
     parser.add_argument("--no-api", action="store_true", help="生成期初时强制使用 SQL 模式（跳过 Infor CSI API）")
-    parser.add_argument("--prev-dir", default=db_sec.get("prev_dir", "Previous Balance"))
-    parser.add_argument("--output-dir", default=db_sec.get("output_dir", None))
+    parser.add_argument("--prev-dir", default=os.environ.get("PREV_DIR", "Previous Balance"))
+    parser.add_argument("--output-dir", default=os.environ.get("OUTPUT_DIR", None))
     parser.add_argument("-o", "--output", help="输出文件名 (单站点模式)")
     # 邮件
     parser.add_argument("--no-email", action="store_true", help="不发送邮件")
     parser.add_argument("--email-to",
-        default=os.environ.get("MAIL_TO") or mail_sec.get("to", "jason.pang@nai-group.com;shirley.ni@nai-group.com;devin.hua@nai-group.com;chn_planners@nai-group.com;chn_buyer@nai-group.com"))
+        default=os.environ.get("MAIL_TO", "jason.pang@nai-group.com;shirley.ni@nai-group.com;devin.hua@nai-group.com;chn_planners@nai-group.com;chn_buyer@nai-group.com"))
     parser.add_argument("--email-cc",
-        default=os.environ.get("MAIL_CC") or mail_sec.get("cc", "sky.li@nai-group.com;frank.liu@nai-group.com;shirley.ni@nai-group.com"))
+        default=os.environ.get("MAIL_CC", "sky.li@nai-group.com;frank.liu@nai-group.com;shirley.ni@nai-group.com"))
     parser.add_argument("--email-from",
-        default=os.environ.get("MAIL_FROM") or mail_sec.get("from_addr", "suzinventoryvaluationdailyreport@nai-group.com"))
-    # SMTP（优先级：.env → config.ini → 默认值）
-    parser.add_argument("--smtp-host",
-        default=os.environ.get("SMTP_HOST") or smtp_sec.get("host", "localhost"))
-    parser.add_argument("--smtp-port",     type=int,
-        default=int(os.environ.get("SMTP_PORT") or smtp_sec.get("port", 25)))
-    parser.add_argument("--smtp-user",
-        default=os.environ.get("SMTP_USER") or smtp_sec.get("user", ""))
-    parser.add_argument("--smtp-password",
-        default=os.environ.get("SMTP_PASSWORD") or smtp_sec.get("password", ""))
+        default=os.environ.get("MAIL_FROM", "suzinventoryvaluationdailyreport@nai-group.com"))
+    # SMTP（优先级：.env → 默认值）
+    parser.add_argument("--smtp-host",     default=os.environ.get("SMTP_HOST", "localhost"))
+    parser.add_argument("--smtp-port",     type=int, default=int(os.environ.get("SMTP_PORT", 25)))
+    parser.add_argument("--smtp-user",     default=os.environ.get("SMTP_USER", ""))
+    parser.add_argument("--smtp-password", default=os.environ.get("SMTP_PASSWORD", ""))
     parser.add_argument("--smtp-tls",      action="store_true",
-        default=(os.environ.get("SMTP_TLS") or smtp_sec.get("tls", "false")).lower() == "true")
+        default=os.environ.get("SMTP_TLS", "false").lower() == "true")
 
     args = parser.parse_args()
 
@@ -1629,7 +1591,7 @@ def main():
 
 
 if __name__ == "__main__":
-    # ── 加载 .env 到环境变量（优先于 config.ini）──
+    # ── 加载 .env 到环境变量 ──
     try:
         from dotenv import load_dotenv
         load_dotenv()
