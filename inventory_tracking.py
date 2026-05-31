@@ -906,7 +906,8 @@ def send_summary_email(
 
 # Infor CSI API 站点参数配置
 # clmParam 格式：M,PMT,B,ABC,0,1,,,,,,,0,0,{site}
-# 取 PMTCode=P（Purchased Material）的 ABC 全等级，只含有库存品
+# 第二个字段 PMTCode 留空 = 包含所有物料类型（采购件 P + 制造件 M）
+# 注：MTD 事务查询仍限定 PMTCode='P'（采购件），与期初口径不同
 INFOR_API_BASE = "https://mingle-ionapi.inforcloudsuite.com"
 INFOR_TENANT = "NAIGROUP_PRD"
 INFOR_IDO = "SLItemCostingReport"
@@ -917,15 +918,15 @@ INFOR_PROPERTIES = "Item,Itemdesc,Units,Unitcost,Unitscost"
 # 格式说明：M=制造 / PMT=采购类型 / B=选 / ABC=ABC分类 / 0,1=参数占位 / 最后参数=SiteRef
 SITE_API_CONFIG = {
     "310": {
-        "clmParam": "M,PMT,B,ABC,0,1,,,,,,,0,0,310",
+        "clmParam": "M,,,B,ABC,0,1,,,,,,,0,0,310",
         "mongoose_config": "NAIGROUP_PRD_310",
     },
     "330": {
-        "clmParam": "M,PMT,B,ABC,0,1,,,,,,,0,0,330",
+        "clmParam": "M,,,B,ABC,0,1,,,,,,,0,0,330",
         "mongoose_config": "NAIGROUP_PRD_330",
     },
     "410": {
-        "clmParam": "M,PMT,B,ABC,0,1,,,,,,,0,0,410",
+        "clmParam": "M,,,B,ABC,0,1,,,,,,,0,0,410",
         "mongoose_config": "NAIGROUP_PRD_410",
     },
 }
@@ -1194,7 +1195,7 @@ def _fetch_infor_site(site_ref: str, token: str, token_expired_retry: bool = Fal
     print(f"  ✅ Site {site_ref}: API 返回 {len(df)} 条记录")
 
     if df.empty:
-        print(f"  ⚠️  Site {site_ref}: 未返回数据（可能 clmParam 参数有误或站点无采购物料）")
+        print(f"  ⚠️  Site {site_ref}: 未返回数据（可能 clmParam 参数有误或站点无库存物料）")
         return pd.DataFrame(columns=["Item", "Description", "Per", "Unitcost", "Unitscost"])
 
     # 列名标准化
@@ -1290,20 +1291,20 @@ def _fetch_opening_via_sql(server, username, password, database, port=1433) -> p
     """
     SQL Fallback：直接查询 SLItems 表获取库存快照。
     仅在 Infor API 不可用时调用。
+    包含所有有库存的物料（采购件 + 制造件）。
     """
     conn = _db_connect(server, username, password, database, port)
     query = """
         SELECT SiteRef,
                item,
                Description,
-               'Purchased' AS Sourcing,
+               PMTCode AS Sourcing,
                ProductCode,
                CAST(OnHand AS DECIMAL(20,8)) AS Per,
                CAST(DerUnitCost AS DECIMAL(20,8)) AS Unitcost,
                CAST(OnHand * DerUnitCost AS DECIMAL(20,8)) AS Unitscost
         FROM [csi_datawarehouse].[dbo].[SLItems]
         WHERE SiteRef IN ('310', '330', '410')
-          AND PMTCode = 'P'
           AND OnHand <> 0
         ORDER BY SiteRef, ProductCode, item
     """
@@ -1320,11 +1321,12 @@ def generate_opening_balance(
     """
     生成期初库存余额 Excel 文件（一个站点一个文件）。
     文件写入 output_dir/site XXX.xlsx，供日常报表读取。
-    仅含 PMTCode='P'（采购物料），与日常报表口径一致。
+    包含所有有库存的物料（采购件 + 制造件）。
 
     数据来源优先级：
       1. Infor CSI API（use_api=True，默认）：调用 SLItemCostingReport IDO
-      2. SQL Fallback（use_api=False 或 API 失败时）：直接查询 SLItems 表
+         （clmParam 第二个字段 PMTCode 留空，包含所有物料类型）
+      2. SQL Fallback（use_api=False 或 API 失败时）：直接查询 SLItems 表，不过滤 PMTCode
 
     参数：
       server/username/password/database/port — SQL fallback 用的数据库连接参数
