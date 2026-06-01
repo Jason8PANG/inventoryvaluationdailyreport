@@ -983,16 +983,16 @@ def send_summary_email(
 </table>
 """
 
-    # ── Month-over-Month Comparison (04/30 vs Current) ──
-    PREV_MONTH_RMFG = {  # 04/30 期初库存 (RM+FG)
+    # ── Month-over-Month Comparison (05/30 vs Current) ──
+    PREV_MONTH_RMFG = {  # 05/30 期初库存 (RM+FG)
         "310": 6370214.86,
         "330": 377778.74,
         "410": 3490925.77,
     }
-    PREV_MONTH_WIP = {   # 04/30 WIP
+    PREV_MONTH_WIP = {   # 05/30 WIP
         "310": 160522.97,
         "330": 52296.89,
-        "410": 88142.77,
+        "410": 157920.87,
     }
     prev_total_all = sum(PREV_MONTH_RMFG.values()) + sum(PREV_MONTH_WIP.values())
     mom_change = asia_t_bal - prev_total_all
@@ -1041,7 +1041,7 @@ def send_summary_email(
   style="border-collapse:collapse;font-size:10pt;text-align:right;width:100%;max-width:900px">
 <tr style="background-color:#548235;color:white;text-align:center">
   <th style="width:20%;text-align:left">Site</th>
-  <th style="width:20%">04/30 Total</th>
+  <th style="width:20%">05/30 Total</th>
   <th style="width:20%">{date_label} Total</th>
   <th style="width:20%">Variance ($)</th>
   <th style="width:20%">Variance (%)</th>
