@@ -932,7 +932,8 @@ def send_summary_email(
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     # 附件
-    for site in gt["Site"]:
+    group_totals = result.get("group_totals", pd.DataFrame())
+    for site in group_totals["Site"]:
         fname = f"Inventory_Balance_{SITE_NAMES.get(site, site)}_{today.strftime('%Y%m')}.xlsx"
         fpath = str(result["out_dir"] / fname)
         if os.path.exists(fpath):
