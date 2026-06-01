@@ -915,6 +915,74 @@ def send_summary_email(
 </table>
 """
 
+    # ── Asia Total 汇总表 ──
+    asia_rm_prev = sum(site_breakdown.get(s, {}).get("RM", {}).get("prev", 0) for s in all_sites)
+    asia_rm_recv = sum(site_breakdown.get(s, {}).get("RM", {}).get("recv", 0) for s in all_sites)
+    asia_rm_cons = sum(site_breakdown.get(s, {}).get("RM", {}).get("cons", 0) for s in all_sites)
+    asia_rm_other = sum(site_breakdown.get(s, {}).get("RM", {}).get("other", 0) for s in all_sites)
+    asia_rm_bal = sum(site_breakdown.get(s, {}).get("RM", {}).get("bal", 0) for s in all_sites)
+
+    asia_fg_prev = sum(site_breakdown.get(s, {}).get("FG", {}).get("prev", 0) for s in all_sites)
+    asia_fg_recv = sum(site_breakdown.get(s, {}).get("FG", {}).get("recv", 0) for s in all_sites)
+    asia_fg_cons = sum(site_breakdown.get(s, {}).get("FG", {}).get("cons", 0) for s in all_sites)
+    asia_fg_other = sum(site_breakdown.get(s, {}).get("FG", {}).get("other", 0) for s in all_sites)
+    asia_fg_bal = sum(site_breakdown.get(s, {}).get("FG", {}).get("bal", 0) for s in all_sites)
+
+    asia_wip_bal = sum(wip_totals.get(s, 0.0) for s in all_sites)
+
+    asia_t_prev = asia_rm_prev + asia_fg_prev
+    asia_t_recv = asia_rm_recv + asia_fg_recv
+    asia_t_cons = asia_rm_cons + asia_fg_cons
+    asia_t_other = asia_rm_other + asia_fg_other
+    asia_t_bal = asia_rm_bal + asia_fg_bal + asia_wip_bal
+
+    tables_html += f"""
+<p style="margin-top:24px"><b>Asia Total — {date_label}</b></p>
+<table border="1" cellpadding="5" cellspacing="0"
+  style="border-collapse:collapse;font-size:10pt;text-align:right;width:100%;max-width:900px">
+<tr style="background-color:#4472C4;color:white;text-align:center">
+  <th style="width:16%;text-align:left">&nbsp;</th>
+  <th style="width:18%">{prev_eom_label} Balance</th>
+  <th style="width:18%">MTD Received</th>
+  <th style="width:18%">MTD Consumed</th>
+  <th style="width:18%">MTD Other Transaction</th>
+  <th style="width:18%">MTD Daily Balance</th>
+</tr>
+<tr>
+  <td style="text-align:left;font-weight:bold">RM</td>
+  <td>{fmt_num(asia_rm_prev)}</td>
+  <td>{fmt_num(asia_rm_recv)}</td>
+  <td>{fmt_num(asia_rm_cons)}</td>
+  <td>{fmt_num(asia_rm_other)}</td>
+  <td><b>{fmt_num(asia_rm_bal)}</b></td>
+</tr>
+<tr>
+  <td style="text-align:left;font-weight:bold">FG/Semi FG</td>
+  <td>{fmt_num(asia_fg_prev)}</td>
+  <td>{fmt_num(asia_fg_recv)}</td>
+  <td>{fmt_num(asia_fg_cons)}</td>
+  <td>{fmt_num(asia_fg_other)}</td>
+  <td><b>{fmt_num(asia_fg_bal)}</b></td>
+</tr>
+<tr style="background-color:#FFF2CC">
+  <td style="text-align:left;font-weight:bold">WIP</td>
+  <td>&nbsp;</td>
+  <td>0</td>
+  <td>0</td>
+  <td>0</td>
+  <td><b>{fmt_num(asia_wip_bal)}</b></td>
+</tr>
+<tr style="background-color:#4472C4;color:white;font-weight:bold">
+  <td style="text-align:left">Total</td>
+  <td>{fmt_num(asia_t_prev)}</td>
+  <td>{fmt_num(asia_t_recv)}</td>
+  <td>{fmt_num(asia_t_cons)}</td>
+  <td>{fmt_num(asia_t_other)}</td>
+  <td><b>{fmt_num(asia_t_bal)}</b></td>
+</tr>
+</table>
+"""
+
     html_body = f"""<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt">
 <p>Below is the {month_label} Inventory Valuation Tracking Report.
 <br>All amounts in USD. Site 330 CNY amounts converted at rate 6.838784.
