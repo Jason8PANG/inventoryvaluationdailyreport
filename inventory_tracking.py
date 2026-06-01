@@ -751,12 +751,18 @@ def run_all_sites(
           f"+Cons: ${grand_cons:,.2f}  +Other: ${grand_other:,.2f}  "
           f"= ${grand_bal:,.2f}")
 
+    # ── 获取 WIP 数据 ──
+    wip_totals = fetch_wip_totals(sites=list(all_summaries.keys()))
+    grand_wip = sum(wip_totals.values())
+    print(f"\n  📦 WIP Grand Total (USD): ${grand_wip:,.2f}")
+
     return {
         "combined": combined,
         "group_totals": group_totals,
         "grand_prev": grand_prev, "grand_recv": grand_recv,
         "grand_cons": grand_cons, "grand_other": grand_other,
         "grand_bal": grand_bal, "out_dir": out_dir,
+        "wip_totals": wip_totals, "grand_wip": grand_wip,
     }
 
 
@@ -828,6 +834,36 @@ def send_summary_email(
     prev_month = (today.replace(day=1) - timedelta(days=1))
     prev_eom_label = prev_month.strftime("%m/%d")
 
+    # ── WIP 汇总段落 ──
+    wip_totals = result.get("wip_totals", {})
+    grand_wip = result.get("grand_wip", 0.0)
+    wip_rows_html = ""
+    for site_ref, wip_usd in wip_totals.items():
+        label = f"{site_ref} ({SITE_NAMES.get(site_ref, site_ref)})"
+        wip_rows_html += (
+            f"<tr>"
+            f"<td style='text-align:left'>{label}</td>"
+            f"<td><b>{fmt_num(wip_usd)}</b></td>"
+            f"</tr>\n"
+        )
+    wip_rows_html += (
+        f"<tr style='background-color:#D6E4F0;font-weight:bold'>"
+        f"<td style='text-align:left'>Grand Total</td>"
+        f"<td><b>{fmt_num(grand_wip)}</b></td>"
+        f"</tr>\n"
+    )
+    wip_section_html = f"""
+<p style="margin-top:18px"><b>WIP (Work-In-Process) Balance — {date_label}</b>
+<br><span style="font-size:9pt;color:#666">All amounts in USD. Site 330 CNY converted at 6.838784.</span></p>
+<table border="1" cellpadding="5" cellspacing="0"
+  style="border-collapse:collapse;font-size:10pt;text-align:right">
+<tr style="background-color:#4472C4;color:white;text-align:center">
+  <th>Site</th><th>WIP Balance (USD)</th>
+</tr>
+{wip_rows_html}
+</table>
+"""
+
     html_body = f"""<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt">
 <p>Below is the {month_label} Inventory Valuation Tracking Report (Purchased Materials, PMTCode=P). All amounts in USD. Site 330 CNY amounts converted at rate 6.838784.</p>
 
@@ -841,6 +877,7 @@ def send_summary_email(
 </tr>
 {rows_html}
 </table>
+{wip_section_html}
 </div>"""
 
     # ── 构建 MIME 邮件 ──
@@ -927,6 +964,37 @@ SITE_API_CONFIG = {
     },
     "410": {
         "clmParam": "M,,,B,ABC,0,1,,,,,,,0,0,410",
+        "mongoose_config": "NAIGROUP_PRD_410",
+    },
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# WIP (Work-In-Process) API 配置
+# IDO:  SLTotalWIPValuebyAccountReport
+# Proc: Rpt_TotalWIPValuebyAccountSp
+# 关键字段：AcctTot（各科目合计），IsDetail=1 为明细行
+# ──────────────────────────────────────────────────────────────
+INFOR_WIP_IDO   = "SLTotalWIPValuebyAccountReport"
+INFOR_WIP_PROC  = "Rpt_TotalWIPValuebyAccountSp"
+INFOR_WIP_PROPS = (
+    "JobAcct,AcctUnit1,AcctUnit2,AcctUnit3,AcctUnit4,"
+    "JobWipLbrTotal,JobWipMatlTotal,JobWipFovhdTotal,JobWipVovhdTotal,JobWipOutTotal,"
+    "AcctTot,Des,IsDetail,GLTotal,Diff"
+)
+# clmParam 格式：,,,,,,,,0000,9999,RS,0,0,0,0,0,,,OI,{site},0
+# 第 20 个字段（0-based index 19）= SiteRef
+SITE_WIP_CONFIG = {
+    "310": {
+        "clmParam": ",,,,,,,,0000,9999,RS,0,0,0,0,0,,,OI,310,0",
+        "mongoose_config": "NAIGROUP_PRD_310",
+    },
+    "330": {
+        "clmParam": ",,,,,,,,0000,9999,RS,0,0,0,0,0,,,OI,330,0",
+        "mongoose_config": "NAIGROUP_PRD_330",
+    },
+    "410": {
+        "clmParam": ",,,,,,,,0000,9999,RS,0,0,0,0,0,,,OI,410,0",
         "mongoose_config": "NAIGROUP_PRD_410",
     },
 }
@@ -1217,6 +1285,154 @@ def _fetch_infor_site(site_ref: str, token: str, token_expired_retry: bool = Fal
     df = df[df["Unitscost"] != 0].copy()
 
     return df[["Item", "Description", "Per", "Unitcost", "Unitscost"]]
+
+
+def _fetch_wip_site(site_ref: str, token: str, token_expired_retry: bool = False) -> float:
+    """
+    调用 Infor CSI IDO API 获取指定站点的 WIP 总金额（AcctTot 汇总行合计）。
+
+    返回 float：该站点 WIP 的 AcctTot 合计（原始货币，330 为 CNY）。
+    调用方负责货币换算。
+
+    token_expired_retry=True 时表示已在重试中，不再重试 401。
+    """
+    site_cfg = SITE_WIP_CONFIG[site_ref]
+    clm_param = urllib.parse.quote(site_cfg["clmParam"], safe="")
+    url = (
+        f"{INFOR_API_BASE}/{INFOR_TENANT}/CSI/IDORequestService/ido/load/{INFOR_WIP_IDO}"
+        f"?clm={INFOR_WIP_PROC}"
+        f"&properties={urllib.parse.quote(INFOR_WIP_PROPS, safe='')}"
+        f"&clmParam={clm_param}"
+        f"&readonly=true"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Infor-MongooseConfig": site_cfg["mongoose_config"],
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    print(f"  🌐 WIP API: Site {site_ref} ({site_cfg['mongoose_config']})...")
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        if e.code == 401 and not token_expired_retry:
+            print(f"  🔄 WIP Site {site_ref}: Token 过期 (401)，强制刷新...")
+            new_token = _load_infor_token(force_refresh=True)
+            return _fetch_wip_site(site_ref, new_token, token_expired_retry=True)
+        elif e.code == 401:
+            raise RuntimeError(
+                f"❌ WIP API 认证失败 (401) - Site {site_ref}\n"
+                f"   Token 刷新后仍然无效，请检查 OAuth2 凭据"
+            ) from e
+        elif e.code == 502:
+            raise RuntimeError(
+                f"❌ WIP API 502 Bad Gateway - Site {site_ref}\n"
+                f"   响应：{body[:300]}"
+            ) from e
+        else:
+            raise RuntimeError(
+                f"❌ WIP API HTTP {e.code} - Site {site_ref}\n"
+                f"   响应：{body[:300]}"
+            ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"❌ WIP 网络连接失败 - Site {site_ref}: {e.reason}"
+        ) from e
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"❌ WIP API 返回非 JSON - Site {site_ref}: {e}\n"
+            f"   响应前 500 字符：{raw[:500]}"
+        ) from e
+
+    # 解析 IDO 响应，提取 AcctTot 列（index 10）
+    props = [p.strip() for p in INFOR_WIP_PROPS.split(",")]
+    acct_tot_idx = props.index("AcctTot")
+    is_detail_idx = props.index("IsDetail")
+
+    rows = []
+    try:
+        item_list = data.get("Items", {})
+        if isinstance(item_list, dict):
+            item_list = item_list.get("Items", [])
+        if not isinstance(item_list, list):
+            raise ValueError(f"响应结构异常，Items 不是列表: {type(item_list)}")
+
+        for record in item_list:
+            values = record.get("PropValue", [])
+            if len(values) < len(props):
+                values += [""] * (len(props) - len(values))
+            rows.append(values)
+
+    except Exception as e:
+        raise RuntimeError(
+            f"❌ WIP API 响应解析失败 - Site {site_ref}: {e}\n"
+            f"   响应结构：{str(data)[:500]}"
+        ) from e
+
+    if not rows:
+        print(f"  ⚠️  WIP Site {site_ref}: 未返回数据，金额视为 0")
+        return 0.0
+
+    # 只取汇总行（IsDetail == 0 或空），AcctTot 累加
+    total = 0.0
+    for row in rows:
+        is_detail = str(row[is_detail_idx]).strip()
+        if is_detail in ("", "0", "false", "False"):
+            val = row[acct_tot_idx]
+            try:
+                total += float(val) if val not in ("", None) else 0.0
+            except (ValueError, TypeError):
+                pass
+
+    print(f"  ✅ WIP Site {site_ref}: AcctTot 合计 = {total:,.2f}")
+    return total
+
+
+def fetch_wip_totals(sites: Optional[List[str]] = None) -> Dict[str, float]:
+    """
+    获取各站点 WIP 总金额（USD）。
+    - 310 / 410：API 返回 USD，直接使用
+    - 330：API 返回 CNY，按 ÷6.838784 换算 USD
+
+    返回 {site_ref: wip_usd_amount}
+    失败的站点以 0.0 填充（不阻断主流程）。
+    """
+    if sites is None:
+        sites = ["310", "330", "410"]
+
+    print("\n📦 获取 WIP 数据...")
+    try:
+        token = _load_infor_token()
+    except RuntimeError as e:
+        print(f"  ❌ WIP Token 获取失败：{e}")
+        return {s: 0.0 for s in sites}
+
+    wip_totals: Dict[str, float] = {}
+    for site_ref in sites:
+        try:
+            raw_total = _fetch_wip_site(site_ref, token)
+            # 330 是 CNY，换算 USD
+            _, fx = SITE_CURRENCY.get(site_ref, ("USD", 1.0))
+            usd_total = raw_total * fx
+            if fx != 1.0:
+                print(f"  💱 WIP Site {site_ref}: CNY {raw_total:,.2f} → USD {usd_total:,.2f}")
+            wip_totals[site_ref] = round(usd_total, 2)
+        except RuntimeError as e:
+            print(f"  ❌ WIP Site {site_ref} 获取失败：{e}\n     金额记为 0")
+            wip_totals[site_ref] = 0.0
+
+    grand_wip = sum(wip_totals.values())
+    print(f"  📊 WIP Grand Total (USD): ${grand_wip:,.2f}")
+    return wip_totals
 
 
 def _db_connect(server, username, password, database, port=1433):
