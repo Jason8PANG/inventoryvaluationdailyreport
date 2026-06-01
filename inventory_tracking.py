@@ -846,6 +846,13 @@ def send_summary_email(
     prev_month = (today.replace(day=1) - timedelta(days=1))
     prev_eom_label = prev_month.strftime("%m/%d")
 
+    # 5/30 上期 WIP 数据（用于 WIP Balance 列）
+    PREV_MONTH_WIP = {
+        "310": 200903.16,
+        "330": 3717.76,
+        "410": 157920.87,
+    }
+
     # ── 构建每个站点的独立表格 ──
     tables_html = ""
     all_sites = ["310", "330", "410"]
@@ -857,9 +864,10 @@ def send_summary_email(
         rm = sd.get("RM", {})
         fg = sd.get("FG", {})
         wip_bal = wip_totals.get(site, 0.0)
+        prev_wip = PREV_MONTH_WIP.get(site, 0.0)
 
         # 计算 Total 行
-        t_prev = rm.get("prev", 0.0) + fg.get("prev", 0.0)
+        t_prev = rm.get("prev", 0.0) + fg.get("prev", 0.0) + prev_wip
         t_recv = rm.get("recv", 0.0) + fg.get("recv", 0.0)
         t_cons = rm.get("cons", 0.0) + fg.get("cons", 0.0)
         t_other = rm.get("other", 0.0) + fg.get("other", 0.0)
@@ -898,7 +906,7 @@ def send_summary_email(
 </tr>
 <tr style="background-color:#FFF2CC">
   <td style="text-align:left;font-weight:bold">WIP</td>
-  <td>&nbsp;</td>
+  <td>{fmt_num(prev_wip)}</td>
   <td>0</td>
   <td>0</td>
   <td>0</td>
@@ -930,7 +938,8 @@ def send_summary_email(
 
     asia_wip_bal = sum(wip_totals.get(s, 0.0) for s in all_sites)
 
-    asia_t_prev = asia_rm_prev + asia_fg_prev
+    asia_prev_wip = sum(PREV_MONTH_WIP.get(s, 0.0) for s in all_sites)
+    asia_t_prev = asia_rm_prev + asia_fg_prev + asia_prev_wip
     asia_t_recv = asia_rm_recv + asia_fg_recv
     asia_t_cons = asia_rm_cons + asia_fg_cons
     asia_t_other = asia_rm_other + asia_fg_other
@@ -966,7 +975,7 @@ def send_summary_email(
 </tr>
 <tr style="background-color:#FFF2CC">
   <td style="text-align:left;font-weight:bold">WIP</td>
-  <td>&nbsp;</td>
+  <td>{fmt_num(asia_prev_wip)}</td>
   <td>0</td>
   <td>0</td>
   <td>0</td>
@@ -979,80 +988,6 @@ def send_summary_email(
   <td>{fmt_num(asia_t_cons)}</td>
   <td>{fmt_num(asia_t_other)}</td>
   <td><b>{fmt_num(asia_t_bal)}</b></td>
-</tr>
-</table>
-"""
-
-    # ── Month-over-Month Comparison (05/30 vs Current) ──
-    PREV_MONTH_RMFG = {  # 05/30 期初库存 (RM+FG)
-        "310": 6370214.86,
-        "330": 377778.74,
-        "410": 3490925.77,
-    }
-    PREV_MONTH_WIP = {   # 05/30 WIP
-        "310": 200903.16,
-        "330": 52296.89,
-        "410": 157920.87,
-    }
-    prev_total_all = sum(PREV_MONTH_RMFG.values()) + sum(PREV_MONTH_WIP.values())
-    mom_change = asia_t_bal - prev_total_all
-    mom_pct = (mom_change / prev_total_all * 100) if prev_total_all else 0
-
-    comparison_rows = ""
-    for site in all_sites:
-        prev_rmfg = PREV_MONTH_RMFG.get(site, 0)
-        prev_wip  = PREV_MONTH_WIP.get(site, 0)
-        prev_site = prev_rmfg + prev_wip
-
-        curr_rmfg = (site_breakdown.get(site, {}).get("RM", {}).get("bal", 0)
-                     + site_breakdown.get(site, {}).get("FG", {}).get("bal", 0))
-        curr_wip  = wip_totals.get(site, 0.0)
-        curr_site = curr_rmfg + curr_wip
-
-        diff_site = curr_site - prev_site
-        diff_pct  = (diff_site / prev_site * 100) if prev_site else 0
-
-        comparison_rows += f"""
-<tr>
-  <td style="text-align:left">&nbsp;&nbsp;RM/FG ({site})</td>
-  <td>{fmt_num(prev_rmfg)}</td>
-  <td>{fmt_num(curr_rmfg)}</td>
-  <td>{fmt_num(curr_rmfg - prev_rmfg)}</td>
-  <td>{((curr_rmfg - prev_rmfg)/prev_rmfg*100) if prev_rmfg else 0:+.1f}%</td>
-</tr>
-<tr style="background-color:#F2F2F2">
-  <td style="text-align:left">&nbsp;&nbsp;WIP ({site})</td>
-  <td>{fmt_num(prev_wip)}</td>
-  <td>{fmt_num(curr_wip)}</td>
-  <td>{fmt_num(curr_wip - prev_wip)}</td>
-  <td>{((curr_wip - prev_wip)/prev_wip*100) if prev_wip else 0:+.1f}%</td>
-</tr>
-<tr style="font-weight:bold">
-  <td style="text-align:left">{site} ({SITE_NAMES.get(site, site)}) Total</td>
-  <td>{fmt_num(prev_site)}</td>
-  <td><b>{fmt_num(curr_site)}</b></td>
-  <td>{fmt_num(diff_site)}</td>
-  <td>{diff_pct:+.1f}%</td>
-</tr>"""
-
-    tables_html += f"""
-<p style="margin-top:24px"><b>Month-over-Month Comparison — Asia Total</b></p>
-<table border="1" cellpadding="5" cellspacing="0"
-  style="border-collapse:collapse;font-size:10pt;text-align:right;width:100%;max-width:900px">
-<tr style="background-color:#548235;color:white;text-align:center">
-  <th style="width:20%;text-align:left">Site</th>
-  <th style="width:20%">05/30 Total</th>
-  <th style="width:20%">{date_label} Total</th>
-  <th style="width:20%">Variance ($)</th>
-  <th style="width:20%">Variance (%)</th>
-</tr>
-{comparison_rows}
-<tr style="background-color:#548235;color:white;font-weight:bold">
-  <td style="text-align:left">Asia Total</td>
-  <td>{fmt_num(prev_total_all)}</td>
-  <td><b>{fmt_num(asia_t_bal)}</b></td>
-  <td>{fmt_num(mom_change)}</td>
-  <td>{mom_pct:+.1f}%</td>
 </tr>
 </table>
 """
