@@ -360,6 +360,25 @@ class InventoryTracker:
                 if pc and pc != "NAN" and pc != "NONE":
                     project_code_map[str(row["Item"])] = pc
 
+        # 查询 SLItems 获取 PMTCode（P=采购物料/RM，M=制造件/FG）
+        pmtcode_map: Dict[str, str] = {}
+        try:
+            conn = pymssql.connect(
+                server=self.server, database=self.database,
+                user=self.username, password=self.password, port=self.port,
+            )
+            cursor = conn.cursor(as_dict=True)
+            cursor.execute("""
+                SELECT Item, PMTCode
+                FROM [csi_datawarehouse].[dbo].[SLItems]
+                WHERE SiteRef = %s
+            """, (self.site_ref,))
+            for row in cursor.fetchall():
+                pmtcode_map[str(row["Item"])] = str(row["PMTCode"]).strip() if row["PMTCode"] else ""
+            conn.close()
+        except Exception as e:
+            print(f"  ⚠️  查询 PMTCode 失败：{e}，按 'P' 处理")
+
         # Summary aggregation
         items: Dict[str, ItemBalance] = {}
         for _, row in prev_df.iterrows():
@@ -388,10 +407,12 @@ class InventoryTracker:
 
         summary_data = []
         for item, ib in items.items():
+            pmt = pmtcode_map.get(item, "")
             summary_data.append({
                 "ProjectCode": ib.project_code,
                 "Item": item,
                 "Description": ib.description,
+                "PMTCode": pmt,
                 "Prev_Qty": round(ib.prev_qty, 4),
                 "Prev_Balance": round(ib.prev_balance, 2),
                 "Received_Qty": round(ib.recv_qty, 4),
@@ -721,6 +742,32 @@ def run_all_sites(
     print(f"  合并汇总 ({len(all_summaries)} 个站点)")
     print(f"{'='*60}")
 
+    # ── 按 PMTCode(P=RM / M=FG) 分类汇总（供邮件表格使用）──
+    def _agg_site(df: pd.DataFrame, pmt_filter: str) -> Dict[str, float]:
+        """按 PMTCode 过滤后汇总关键字段"""
+        sub = df[df["PMTCode"] == pmt_filter]
+        return {
+            "prev": sub["Prev_Balance"].sum(),
+            "recv": sub["Received_AMT"].sum(),
+            "cons": sub["Consumed_AMT"].sum(),
+            "other": sub["Other_AMT"].sum(),
+            "bal": sub["Balance_AMT"].sum(),
+        }
+
+    site_breakdown: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for site in all_summaries:
+        df_site = all_summaries[site]
+        site_breakdown[site] = {
+            "RM": _agg_site(df_site, "P"),
+            "FG": _agg_site(df_site, "M"),
+        }
+        print(f"\n  Site {site} ({SITE_NAMES.get(site, site)}):")
+        rm = site_breakdown[site]["RM"]
+        fg = site_breakdown[site]["FG"]
+        print(f"    RM  (P): 期初=${rm['prev']:,.2f} +Recv=${rm['recv']:,.2f} +Cons=${rm['cons']:,.2f} +Other=${rm['other']:,.2f} =${rm['bal']:,.2f}")
+        print(f"    FG  (M): 期初=${fg['prev']:,.2f} +Recv=${fg['recv']:,.2f} +Cons=${fg['cons']:,.2f} +Other=${fg['other']:,.2f} =${fg['bal']:,.2f}")
+
+    # 保留旧版 group_totals（兼容 Excel 等）
     group_totals = combined.groupby("Site").agg(
         Items=("Item", "count"),
         Prev_Balance=("Prev_Balance", "sum"),
@@ -729,14 +776,6 @@ def run_all_sites(
         Other_AMT=("Other_AMT", "sum"),
         Balance_AMT=("Balance_AMT", "sum"),
     ).reset_index()
-
-    for _, row in group_totals.iterrows():
-        s = row["Site"]
-        print(f"\n  Site {s} ({SITE_NAMES.get(s, s)}):")
-        print(f"    Items: {row['Items']:,}")
-        print(f"    期初: ${row['Prev_Balance']:,.2f}  +Recv: ${row['Received_AMT']:,.2f}  "
-              f"+Cons: ${row['Consumed_AMT']:,.2f}  +Other: ${row['Other_AMT']:,.2f}  "
-              f"= ${row['Balance_AMT']:,.2f}")
 
     grand_prev = combined["Prev_Balance"].sum()
     grand_recv = combined["Received_AMT"].sum()
@@ -760,6 +799,7 @@ def run_all_sites(
         "grand_cons": grand_cons, "grand_other": grand_other,
         "grand_bal": grand_bal, "out_dir": out_dir,
         "wip_totals": wip_totals, "grand_wip": grand_wip,
+        "site_breakdown": site_breakdown,
     }
 
 
@@ -777,53 +817,29 @@ def send_summary_email(
     smtp_tls: bool = False,
     from_addr: str = "inventory-report@nai-group.com",
 ):
-    """生成固定格式的 HTML 邮件并通过 SMTP 发送"""
-    gt = result["group_totals"]
-    combined = result["combined"]
+    """生成固定格式的 HTML 邮件并通过 SMTP 发送
+
+    邮件格式：每个站点一个独立表格
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │ Site 310 (Plant1)                                                        │
+    ├──────────────┬─────────────┬──────────────┬──────────────┬───────────────┤
+    │              │5/30 Balance │MTD Received  │MTD Consumed  │MTD Daily Bal  │
+    ├──────────────┼─────────────┼──────────────┼──────────────┼───────────────┤
+    │ RM           │ $xxx        │ $xxx         │ $xxx         │ $xxx          │
+    │ FG/Semi FG   │ $xxx        │ $xxx         │ $xxx         │ $xxx          │
+    │ WIP          │             │ 0            │ 0            │ $xxx          │
+    │ Total        │ $xxx        │ $xxx         │ $xxx         │ $xxx          │
+    └──────────────┴─────────────┴──────────────┴──────────────┴───────────────┘
+    """
+    site_breakdown = result.get("site_breakdown", {})
+    wip_totals = result.get("wip_totals", {})
 
     def fmt_num(v):
+        if v is None:
+            return ""
         if v < 0:
             return f"-${abs(v):,.2f}"
         return f"${v:,.2f}"
-
-    def proj_count(site):
-        site_df = combined[combined["Site"] == site]
-        pc = site_df["ProjectCode"].dropna()
-        pc = pc[pc.str.strip() != ""]
-        return len(pc.unique())
-
-    # 构建表格行
-    rows_html = ""
-    for _, row in gt.iterrows():
-        s = row["Site"]
-        label = f"{s} ({SITE_NAMES.get(s, s)})"
-        pc_count = proj_count(s)
-        rows_html += (
-            f"<tr>"
-            f"<td style='text-align:left'>{label}</td>"
-            f"<td>{int(row['Items']):,}</td>"
-            f"<td>{pc_count}</td>"
-            f"<td>{fmt_num(row['Prev_Balance'])}</td>"
-            f"<td>{fmt_num(row['Received_AMT'])}</td>"
-            f"<td>{fmt_num(row['Consumed_AMT'])}</td>"
-            f"<td>{fmt_num(row['Other_AMT'])}</td>"
-            f"<td><b>{fmt_num(row['Balance_AMT'])}</b></td>"
-            f"</tr>\n"
-        )
-
-    total_items = int(gt["Items"].sum())
-    total_pc = sum(proj_count(s) for s in gt["Site"])
-    rows_html += (
-        f"<tr style='background-color:#D6E4F0;font-weight:bold'>"
-        f"<td style='text-align:left'>Grand Total</td>"
-        f"<td>{total_items:,}</td><td>-</td>"
-        f"<td>{fmt_num(result['grand_prev'])}</td>"
-        f"<td>{fmt_num(result['grand_recv'])}</td>"
-        f"<td>{fmt_num(result['grand_cons'])}</td>"
-        f"<td>{fmt_num(result['grand_other'])}</td>"
-        f"<td><b>{fmt_num(result['grand_bal'])}</b></td>"
-        f"</tr>\n"
-    )
 
     today = datetime.today()
     month_label = today.strftime("%B %Y")
@@ -831,50 +847,80 @@ def send_summary_email(
     prev_month = (today.replace(day=1) - timedelta(days=1))
     prev_eom_label = prev_month.strftime("%m/%d")
 
-    # ── WIP 汇总段落 ──
-    wip_totals = result.get("wip_totals", {})
-    grand_wip = result.get("grand_wip", 0.0)
-    wip_rows_html = ""
-    for site_ref, wip_usd in wip_totals.items():
-        label = f"{site_ref} ({SITE_NAMES.get(site_ref, site_ref)})"
-        wip_rows_html += (
-            f"<tr>"
-            f"<td style='text-align:left'>{label}</td>"
-            f"<td><b>{fmt_num(wip_usd)}</b></td>"
-            f"</tr>\n"
-        )
-    wip_rows_html += (
-        f"<tr style='background-color:#D6E4F0;font-weight:bold'>"
-        f"<td style='text-align:left'>Grand Total</td>"
-        f"<td><b>{fmt_num(grand_wip)}</b></td>"
-        f"</tr>\n"
-    )
-    wip_section_html = f"""
-<p style="margin-top:18px"><b>WIP (Work-In-Process) Balance — {date_label}</b>
-<br><span style="font-size:9pt;color:#666">All amounts in USD. Site 330 CNY converted at 6.838784.</span></p>
+    # ── 构建每个站点的独立表格 ──
+    tables_html = ""
+    all_sites = ["310", "330", "410"]
+    for site in all_sites:
+        if site not in site_breakdown:
+            continue
+
+        sd = site_breakdown[site]
+        rm = sd.get("RM", {})
+        fg = sd.get("FG", {})
+        wip_bal = wip_totals.get(site, 0.0)
+
+        # 计算 Total 行
+        t_prev = rm.get("prev", 0.0) + fg.get("prev", 0.0)
+        t_recv = rm.get("recv", 0.0) + fg.get("recv", 0.0)
+        t_cons = rm.get("cons", 0.0) + fg.get("cons", 0.0)
+        t_other = rm.get("other", 0.0) + fg.get("other", 0.0)
+        t_bal = rm.get("bal", 0.0) + fg.get("bal", 0.0) + wip_bal
+
+        label = f"{site} ({SITE_NAMES.get(site, site)})"
+        site_color = {"310": "#1F4E79", "330": "#1F4E79", "410": "#1F4E79"}[site]
+
+        tables_html += f"""
+<p style="margin-top:18px"><b>{label} — {date_label}</b></p>
 <table border="1" cellpadding="5" cellspacing="0"
-  style="border-collapse:collapse;font-size:10pt;text-align:right">
-<tr style="background-color:#4472C4;color:white;text-align:center">
-  <th>Site</th><th>WIP Balance (USD)</th>
+  style="border-collapse:collapse;font-size:10pt;text-align:right;width:100%;max-width:900px">
+<tr style="background-color:{site_color};color:white;text-align:center">
+  <th style="width:16%;text-align:left">&nbsp;</th>
+  <th style="width:18%">{prev_eom_label} Balance</th>
+  <th style="width:18%">MTD Received</th>
+  <th style="width:18%">MTD Consumed</th>
+  <th style="width:18%">MTD Other Transaction</th>
+  <th style="width:18%">MTD Daily Balance</th>
 </tr>
-{wip_rows_html}
+<tr>
+  <td style="text-align:left;font-weight:bold">RM</td>
+  <td>{fmt_num(rm.get('prev', 0))}</td>
+  <td>{fmt_num(rm.get('recv', 0))}</td>
+  <td>{fmt_num(rm.get('cons', 0))}</td>
+  <td>{fmt_num(rm.get('other', 0))}</td>
+  <td><b>{fmt_num(rm.get('bal', 0))}</b></td>
+</tr>
+<tr>
+  <td style="text-align:left;font-weight:bold">FG/Semi FG</td>
+  <td>{fmt_num(fg.get('prev', 0))}</td>
+  <td>{fmt_num(fg.get('recv', 0))}</td>
+  <td>{fmt_num(fg.get('cons', 0))}</td>
+  <td>{fmt_num(fg.get('other', 0))}</td>
+  <td><b>{fmt_num(fg.get('bal', 0))}</b></td>
+</tr>
+<tr style="background-color:#FFF2CC">
+  <td style="text-align:left;font-weight:bold">WIP</td>
+  <td>&nbsp;</td>
+  <td>0</td>
+  <td>0</td>
+  <td>0</td>
+  <td><b>{fmt_num(wip_bal)}</b></td>
+</tr>
+<tr style="background-color:#D6E4F0;font-weight:bold">
+  <td style="text-align:left">Total</td>
+  <td>{fmt_num(t_prev)}</td>
+  <td>{fmt_num(t_recv)}</td>
+  <td>{fmt_num(t_cons)}</td>
+  <td>{fmt_num(t_other)}</td>
+  <td><b>{fmt_num(t_bal)}</b></td>
+</tr>
 </table>
 """
 
     html_body = f"""<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt">
-<p>Below is the {month_label} Inventory Valuation Tracking Report (All Materials, PMTCode P+M). All amounts in USD. Site 330 CNY amounts converted at rate 6.838784.</p>
-
-<table border="1" cellpadding="5" cellspacing="0"
-  style="border-collapse:collapse;font-size:10pt;text-align:right">
-<tr style="background-color:#4472C4;color:white;text-align:center">
-  <th>Site</th><th>Items</th><th>Projects</th>
-  <th>{prev_eom_label} Balance</th><th>MTD Received</th>
-  <th>MTD Consumption</th><th>MTD Other Transaction</th>
-  <th>MTD Daily Balance</th>
-</tr>
-{rows_html}
-</table>
-{wip_section_html}
+<p>Below is the {month_label} Inventory Valuation Tracking Report.
+<br>All amounts in USD. Site 330 CNY amounts converted at rate 6.838784.
+<br>WIP values are fetched dynamically via Infor CSI API.</p>
+{tables_html}
 </div>"""
 
     # ── 构建 MIME 邮件 ──
@@ -1838,9 +1884,9 @@ def main():
     # 邮件
     parser.add_argument("--no-email", action="store_true", help="不发送邮件")
     parser.add_argument("--email-to",
-        default=os.environ.get("MAIL_TO", "jason.pang@nai-group.com;shirley.ni@nai-group.com;devin.hua@nai-group.com;chn_planners@nai-group.com;chn_buyer@nai-group.com"))
+        default=os.environ.get("MAIL_TO", ""))
     parser.add_argument("--email-cc",
-        default=os.environ.get("MAIL_CC", "sky.li@nai-group.com;frank.liu@nai-group.com;shirley.ni@nai-group.com"))
+        default=os.environ.get("MAIL_CC", ""))
     parser.add_argument("--email-from",
         default=os.environ.get("MAIL_FROM", "suzinventoryvaluationdailyreport@nai-group.com"))
     # SMTP（优先级：.env → 默认值）
