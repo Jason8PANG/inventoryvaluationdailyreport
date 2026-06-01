@@ -67,7 +67,7 @@ CATEGORY_MAP: Dict[Tuple[str, str], str] = {
     ("M", "I"): "Other",      # 库存调整
     ("G", "I"): "Other",      # 库存调整
     ("H", "I"): "Other",      # 库存调整
-    # N/J（工单工序转移）不计入
+    ("N", "J"): "Other",      # 工单工序转移
 }
 
 TRANS_DESCRIPTIONS: Dict[Tuple[str, str], str] = {
@@ -317,14 +317,9 @@ class InventoryTracker:
     # ──────────────────────────────────────────────────────────
     # 3. 分类
     # ──────────────────────────────────────────────────────────
-    # 不计入的事务类型（N/J 工单工序转移等）
-    IGNORED_TRANSACTIONS: set = {("N", "J")}
-
     def classify(self, row: pd.Series) -> str:
         key = (str(row.get("TransType", "")).strip().upper(),
                str(row.get("RefType", "")).strip().upper())
-        if key in self.IGNORED_TRANSACTIONS:
-            return "Ignored"
         return CATEGORY_MAP.get(key, "Other")
 
     def _desc(self, tt: str, rt: str) -> str:
@@ -339,9 +334,6 @@ class InventoryTracker:
         trans_df["TransDesc"] = trans_df.apply(
             lambda r: self._desc(r["TransType"], r["RefType"]), axis=1
         )
-
-        # 过滤掉不计入的事务（如 N/J 工单工序转移）
-        trans_df = trans_df[trans_df["Category"] != "Ignored"].copy()
 
         # Detail
         detail_cols = [
