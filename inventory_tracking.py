@@ -984,30 +984,54 @@ def send_summary_email(
 """
 
     # ── Month-over-Month Comparison (04/30 vs Current) ──
-    PREV_MONTH_TOTALS = {
+    PREV_MONTH_RMFG = {  # 04/30 期初库存 (RM+FG)
         "310": 6370214.86,
         "330": 377778.74,
         "410": 3490925.77,
     }
-    prev_total_all = sum(PREV_MONTH_TOTALS.values())
+    PREV_MONTH_WIP = {   # 04/30 WIP
+        "310": 160522.97,
+        "330": 52296.89,
+        "410": 88142.77,
+    }
+    prev_total_all = sum(PREV_MONTH_RMFG.values()) + sum(PREV_MONTH_WIP.values())
     mom_change = asia_t_bal - prev_total_all
     mom_pct = (mom_change / prev_total_all * 100) if prev_total_all else 0
 
     comparison_rows = ""
     for site in all_sites:
-        prev_val = PREV_MONTH_TOTALS.get(site, 0)
-        # 当前站点 Total = RM bal + FG bal + WIP
-        curr_val = (site_breakdown.get(site, {}).get("RM", {}).get("bal", 0)
-                    + site_breakdown.get(site, {}).get("FG", {}).get("bal", 0)
-                    + wip_totals.get(site, 0.0))
-        diff = curr_val - prev_val
-        diff_pct = (diff / prev_val * 100) if prev_val else 0
+        prev_rmfg = PREV_MONTH_RMFG.get(site, 0)
+        prev_wip  = PREV_MONTH_WIP.get(site, 0)
+        prev_site = prev_rmfg + prev_wip
+
+        curr_rmfg = (site_breakdown.get(site, {}).get("RM", {}).get("bal", 0)
+                     + site_breakdown.get(site, {}).get("FG", {}).get("bal", 0))
+        curr_wip  = wip_totals.get(site, 0.0)
+        curr_site = curr_rmfg + curr_wip
+
+        diff_site = curr_site - prev_site
+        diff_pct  = (diff_site / prev_site * 100) if prev_site else 0
+
         comparison_rows += f"""
 <tr>
-  <td style="text-align:left;font-weight:bold">{site} ({SITE_NAMES.get(site, site)})</td>
-  <td>{fmt_num(prev_val)}</td>
-  <td><b>{fmt_num(curr_val)}</b></td>
-  <td>{fmt_num(diff)}</td>
+  <td style="text-align:left">&nbsp;&nbsp;RM/FG ({site})</td>
+  <td>{fmt_num(prev_rmfg)}</td>
+  <td>{fmt_num(curr_rmfg)}</td>
+  <td>{fmt_num(curr_rmfg - prev_rmfg)}</td>
+  <td>{((curr_rmfg - prev_rmfg)/prev_rmfg*100) if prev_rmfg else 0:+.1f}%</td>
+</tr>
+<tr style="background-color:#F2F2F2">
+  <td style="text-align:left">&nbsp;&nbsp;WIP ({site})</td>
+  <td>{fmt_num(prev_wip)}</td>
+  <td>{fmt_num(curr_wip)}</td>
+  <td>{fmt_num(curr_wip - prev_wip)}</td>
+  <td>{((curr_wip - prev_wip)/prev_wip*100) if prev_wip else 0:+.1f}%</td>
+</tr>
+<tr style="font-weight:bold">
+  <td style="text-align:left">{site} ({SITE_NAMES.get(site, site)}) Total</td>
+  <td>{fmt_num(prev_site)}</td>
+  <td><b>{fmt_num(curr_site)}</b></td>
+  <td>{fmt_num(diff_site)}</td>
   <td>{diff_pct:+.1f}%</td>
 </tr>"""
 
