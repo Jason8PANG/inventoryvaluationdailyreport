@@ -1396,41 +1396,23 @@ def _fetch_wip_site(site_ref: str, token: str, token_expired_retry: bool = False
             f"   响应前 500 字符：{raw[:500]}"
         ) from e
 
-    # 解析 IDO 响应，提取 AcctTot 列（index 10）
-    props = [p.strip() for p in INFOR_WIP_PROPS.split(",")]
-    acct_tot_idx = props.index("AcctTot")
-    is_detail_idx = props.index("IsDetail")
+    # 解析 IDO 响应
+    # 响应格式：{"Items": [{"JobAcct": "140200", "AcctTot": "208474.97", "IsDetail": "0", ...}, ...]}
+    # 直接用属性名作为 key 读取，不走 PropValue 数组路径
+    item_list = data.get("Items", [])
+    if not isinstance(item_list, list):
+        raise ValueError(f"响应结构异常，Items 不是列表: {type(item_list)}")
 
-    rows = []
-    try:
-        item_list = data.get("Items", {})
-        if isinstance(item_list, dict):
-            item_list = item_list.get("Items", [])
-        if not isinstance(item_list, list):
-            raise ValueError(f"响应结构异常，Items 不是列表: {type(item_list)}")
-
-        for record in item_list:
-            values = record.get("PropValue", [])
-            if len(values) < len(props):
-                values += [""] * (len(props) - len(values))
-            rows.append(values)
-
-    except Exception as e:
-        raise RuntimeError(
-            f"❌ WIP API 响应解析失败 - Site {site_ref}: {e}\n"
-            f"   响应结构：{str(data)[:500]}"
-        ) from e
-
-    if not rows:
+    if not item_list:
         print(f"  ⚠️  WIP Site {site_ref}: 未返回数据，金额视为 0")
         return 0.0
 
-    # 只取汇总行（IsDetail == 0 或空），AcctTot 累加
+    # 累加所有汇总行（IsDetail == 0 或空）的 AcctTot
     total = 0.0
-    for row in rows:
-        is_detail = str(row[is_detail_idx]).strip()
+    for record in item_list:
+        is_detail = str(record.get("IsDetail", "")).strip()
         if is_detail in ("", "0", "false", "False"):
-            val = row[acct_tot_idx]
+            val = record.get("AcctTot")
             try:
                 total += float(val) if val not in ("", None) else 0.0
             except (ValueError, TypeError):
