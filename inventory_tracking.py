@@ -983,6 +983,56 @@ def send_summary_email(
 </table>
 """
 
+    # ── Month-over-Month Comparison (04/30 vs Current) ──
+    PREV_MONTH_TOTALS = {
+        "310": 6370214.86,
+        "330": 377778.74,
+        "410": 3490925.77,
+    }
+    prev_total_all = sum(PREV_MONTH_TOTALS.values())
+    mom_change = asia_t_bal - prev_total_all
+    mom_pct = (mom_change / prev_total_all * 100) if prev_total_all else 0
+
+    comparison_rows = ""
+    for site in all_sites:
+        prev_val = PREV_MONTH_TOTALS.get(site, 0)
+        # 当前站点 Total = RM bal + FG bal + WIP
+        curr_val = (site_breakdown.get(site, {}).get("RM", {}).get("bal", 0)
+                    + site_breakdown.get(site, {}).get("FG", {}).get("bal", 0)
+                    + wip_totals.get(site, 0.0))
+        diff = curr_val - prev_val
+        diff_pct = (diff / prev_val * 100) if prev_val else 0
+        comparison_rows += f"""
+<tr>
+  <td style="text-align:left;font-weight:bold">{site} ({SITE_NAMES.get(site, site)})</td>
+  <td>{fmt_num(prev_val)}</td>
+  <td><b>{fmt_num(curr_val)}</b></td>
+  <td>{fmt_num(diff)}</td>
+  <td>{diff_pct:+.1f}%</td>
+</tr>"""
+
+    tables_html += f"""
+<p style="margin-top:24px"><b>Month-over-Month Comparison — Asia Total</b></p>
+<table border="1" cellpadding="5" cellspacing="0"
+  style="border-collapse:collapse;font-size:10pt;text-align:right;width:100%;max-width:900px">
+<tr style="background-color:#548235;color:white;text-align:center">
+  <th style="width:20%;text-align:left">Site</th>
+  <th style="width:20%">04/30 Total</th>
+  <th style="width:20%">{date_label} Total</th>
+  <th style="width:20%">Variance ($)</th>
+  <th style="width:20%">Variance (%)</th>
+</tr>
+{comparison_rows}
+<tr style="background-color:#548235;color:white;font-weight:bold">
+  <td style="text-align:left">Asia Total</td>
+  <td>{fmt_num(prev_total_all)}</td>
+  <td><b>{fmt_num(asia_t_bal)}</b></td>
+  <td>{fmt_num(mom_change)}</td>
+  <td>{mom_pct:+.1f}%</td>
+</tr>
+</table>
+"""
+
     html_body = f"""<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt">
 <p>Below is the {month_label} Inventory Valuation Tracking Report.
 <br>All amounts in USD. Site 330 CNY amounts converted at rate 6.838784.
