@@ -286,15 +286,12 @@ class InventoryTracker:
                 CAST(m.[SiteRef] AS int), m.[Item]
             ) AS ProjectCode
         FROM [csi_datawarehouse].[dbo].[SLMatltrans] m
-        INNER JOIN [csi_datawarehouse].[dbo].[SLItems] i
-            ON m.[Item] = i.[Item] AND m.[SiteRef] = i.[SiteRef]
         WHERE m.[SiteRef] = '{self.site_ref}'
           AND m.[TransDate] >= '{month_start.strftime('%Y-%m-%d')}'
-          AND i.[PMTCode] = 'P'
         ORDER BY m.[TransDate], m.[TransNum]
         """
 
-        print(f"  📊 查询 {self.database} Site {self.site_ref} 采购物料 (PMTCode=P) ({month_start.strftime('%Y-%m-%d')} ~)")
+        print(f"  📊 查询 {self.database} Site {self.site_ref} 所有物料 (P+M) ({month_start.strftime('%Y-%m-%d')} ~)")
 
         try:
             conn = self._get_connection()
@@ -515,14 +512,14 @@ class InventoryTracker:
         ws = wb.create_sheet("Summary")
 
         ws.merge_cells("A1:M1")
-        ws["A1"] = f"库存金额跟踪报表 - Site {self.site_ref} ({site_label}) - 采购物料 (PMTCode=P)"
+        ws["A1"] = f"库存金额跟踪报表 - Site {self.site_ref} ({site_label}) - 所有物料 (P+M)"
         ws["A1"].font = TITLE_FONT
         ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
 
         ws.merge_cells("A2:M2")
         ws["A2"] = (f"报告周期：{today.strftime('%Y年%m月')} 1日 - {today.strftime('%m月%d日')}   |   "
                      f"数据截至：{today.strftime('%Y-%m-%d %H:%M')}   |   "
-                     f"仅含采购物料")
+                     f"含采购物料 (P) + 制造件 (M)")
         ws["A2"].alignment = Alignment(horizontal="center")
         ws["A2"].font = Font(size=10, italic=True, color="666666")
 
@@ -583,7 +580,7 @@ class InventoryTracker:
 
         det_cols = len(detail_df.columns)
         ws_det.merge_cells(f"A1:{get_column_letter(det_cols)}1")
-        ws_det["A1"] = f"物料事务明细 - Site {self.site_ref} ({site_label}) - 采购物料 (PMTCode=P)"
+        ws_det["A1"] = f"物料事务明细 - Site {self.site_ref} ({site_label}) - 所有物料 (P+M)"
         ws_det["A1"].font = TITLE_FONT
         ws_det["A1"].alignment = Alignment(horizontal="center", vertical="center")
         ws_det.row_dimensions[1].height = 28
@@ -618,7 +615,7 @@ class InventoryTracker:
 
         wb.save(output_path)
         print(f"  📄 报表已导出：{output_path.absolute()}")
-        print(f"     Summary: {len(summary_df):,} Items (PMTCode=P)")
+        print(f"     Summary: {len(summary_df):,} Items (P+M)")
         print(f"     Detail: {len(detail_df):,} records")
         print(f"     Project Summary: {len(proj_group):,} Project Codes")
 
@@ -865,7 +862,7 @@ def send_summary_email(
 """
 
     html_body = f"""<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt">
-<p>Below is the {month_label} Inventory Valuation Tracking Report (Purchased Materials, PMTCode=P). All amounts in USD. Site 330 CNY amounts converted at rate 6.838784.</p>
+<p>Below is the {month_label} Inventory Valuation Tracking Report (All Materials, PMTCode P+M). All amounts in USD. Site 330 CNY amounts converted at rate 6.838784.</p>
 
 <table border="1" cellpadding="5" cellspacing="0"
   style="border-collapse:collapse;font-size:10pt;text-align:right">
@@ -944,7 +941,7 @@ def send_summary_email(
 # Infor CSI API 站点参数配置
 # clmParam 格式：M,PMT,B,ABC,0,1,,,,,,,0,0,{site}
 # 第二个字段 PMTCode 留空 = 包含所有物料类型（采购件 P + 制造件 M）
-# 注：MTD 事务查询仍限定 PMTCode='P'（采购件），与期初口径不同
+# 期初库存与 MTD 事务查询均包含所有物料类型（P+M），口径一致
 INFOR_API_BASE = "https://mingle-ionapi.inforcloudsuite.com"
 INFOR_TENANT = "NAIGROUP_PRD"
 INFOR_IDO = "SLItemCostingReport"
