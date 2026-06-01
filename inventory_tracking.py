@@ -50,40 +50,39 @@ from openpyxl.utils import get_column_letter
 # TransType + RefType → Category 映射规则
 # ──────────────────────────────────────────────────────────────
 CATEGORY_MAP: Dict[Tuple[str, str], str] = {
-    # Received (入库)
-    ("R", "P"): "Received",   # PO Receipt
-    ("W", "P"): "Received",   # PO Withdraw
+    # Received (增加库存)
+    ("R", "P"): "Received",   # 采购收料
+    ("C", "J"): "Received",   # 工单完工
+    ("F", "J"): "Received",   # 工单完工
+    ("W", "J"): "Received",   # 工单退料（退回仓库）
+    ("W", "R"): "Received",   # RMA 退货（退回仓库）
 
-    # Consumed (消耗)
-    ("I", "J"): "Consumed",   # Job Issue / WIP Change
-    ("W", "J"): "Consumed",   # Job Withdrawal / Return
-    ("S", "O"): "Consumed",   # Order Ship
+    # Consumed (减少库存)
+    ("I", "J"): "Consumed",   # 工单发料
+    ("S", "O"): "Consumed",   # 客户订单发货
+    ("W", "P"): "Consumed",   # 采购退料（退回供应商）
 
-    # Other Transaction (其他)
-    ("A", "I"): "Other",      # Adjustment
-    ("M", "I"): "Other",      # Stock Move
-    ("G", "I"): "Other",      # Misc Receipt
-    ("H", "I"): "Other",      # Misc Issue
-    ("C", "J"): "Other",      # Job Complete
-    ("F", "J"): "Other",      # Job Finish
-    ("N", "J"): "Other",      # Job Labor / Next Operation
-    ("W", "R"): "Other",      # RMA Withdraw
+    # Other Transaction (库存调整)
+    ("A", "I"): "Other",      # 库存调整
+    ("M", "I"): "Other",      # 库存调整
+    ("G", "I"): "Other",      # 库存调整
+    ("H", "I"): "Other",      # 库存调整
+    # N/J（工单工序转移）不计入
 }
 
 TRANS_DESCRIPTIONS: Dict[Tuple[str, str], str] = {
     ("R", "P"): "PO Receipt",
-    ("W", "P"): "PO Withdraw",
-    ("I", "J"): "Job Issue / WIP Change",
-    ("W", "J"): "Job Withdrawal / Return",
-    ("S", "O"): "Order Ship",
-    ("A", "I"): "Adjustment",
-    ("M", "I"): "Stock Move",
-    ("G", "I"): "Misc Receipt",
-    ("H", "I"): "Misc Issue",
     ("C", "J"): "Job Complete",
     ("F", "J"): "Job Finish",
-    ("N", "J"): "Job Labor / Next Operation",
-    ("W", "R"): "RMA Withdraw",
+    ("W", "J"): "Job Return to Whse",
+    ("W", "R"): "RMA Return",
+    ("I", "J"): "Job Issue",
+    ("S", "O"): "Customer Shipment",
+    ("W", "P"): "PO Return to Vendor",
+    ("A", "I"): "Inventory Adjustment",
+    ("M", "I"): "Inventory Adjustment",
+    ("G", "I"): "Inventory Adjustment",
+    ("H", "I"): "Inventory Adjustment",
 }
 
 SITE_NAMES = {"310": "Plant1", "330": "Plant2", "410": "PNG"}
@@ -318,9 +317,14 @@ class InventoryTracker:
     # ──────────────────────────────────────────────────────────
     # 3. 分类
     # ──────────────────────────────────────────────────────────
+    # 不计入的事务类型（N/J 工单工序转移等）
+    IGNORED_TRANSACTIONS: set = {("N", "J")}
+
     def classify(self, row: pd.Series) -> str:
         key = (str(row.get("TransType", "")).strip().upper(),
                str(row.get("RefType", "")).strip().upper())
+        if key in self.IGNORED_TRANSACTIONS:
+            return "Ignored"
         return CATEGORY_MAP.get(key, "Other")
 
     def _desc(self, tt: str, rt: str) -> str:
@@ -335,6 +339,9 @@ class InventoryTracker:
         trans_df["TransDesc"] = trans_df.apply(
             lambda r: self._desc(r["TransType"], r["RefType"]), axis=1
         )
+
+        # 过滤掉不计入的事务（如 N/J 工单工序转移）
+        trans_df = trans_df[trans_df["Category"] != "Ignored"].copy()
 
         # Detail
         detail_cols = [
