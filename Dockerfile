@@ -36,4 +36,4 @@ COPY config.ini .
 RUN mkdir -p /app/reports
 
 # 默认命令：守护模式，每天 00:00 同步数据，09:00 跑报表
-CMD ["python", "inventory_tracking.py", "--all-sites", "--daemon", "--output-dir", "/app/reports"]
+CMD ["python", "inventory_tracking.py", "--all-sites", "--daemon"]
