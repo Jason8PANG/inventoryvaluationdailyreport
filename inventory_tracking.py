@@ -2323,7 +2323,12 @@ def schedule_loop(run_func, args):
                 else:
                     print(f"  ✅ daily_inventory_snapshot.py 同步完成")
             elif task_type == "report":
-                run_func(args)
+                # 报表截止到前一天：6/3 09:00 发 6/2 的报表
+                import copy
+                yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+                report_args = copy.copy(args)
+                report_args.as_of_date = yesterday
+                run_func(report_args)
         except Exception as e:
             print(f"❌ Scheduled run failed: {e}")
             import traceback
