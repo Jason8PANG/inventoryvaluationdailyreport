@@ -3,7 +3,7 @@
 库存金额跟踪系统 - 演示/测试版本
 ==============================
 此版本不连接真实数据库，使用模拟数据演示分类和计算逻辑。
-用于验证分类规则是否正确，无需安装 pyodbc。
+分类与主流程 inventory_tracking.py 保持一致。
 """
 
 import pandas as pd
@@ -14,18 +14,18 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # ── TransType + RefType → Category 映射 ──
 CATEGORY_MAP = {
     ("R", "P"): "Received",
-    ("W", "P"): "Received",
+    ("C", "J"): "Received",
+    ("F", "J"): "Received",
+    ("W", "J"): "Received",
+    ("W", "R"): "Received",
     ("I", "J"): "Consumed",
-    ("W", "J"): "Consumed",
     ("S", "O"): "Consumed",
+    ("W", "P"): "Consumed",
     ("A", "I"): "Other",
     ("M", "I"): "Other",
     ("G", "I"): "Other",
     ("H", "I"): "Other",
-    ("C", "J"): "Other",
-    ("F", "J"): "Other",
-    ("N", "J"): "Other",
-    ("W", "R"): "Other",
+    ("N", "J"): "Ignored",
 }
 
 # ── 模拟数据 ──
@@ -102,9 +102,10 @@ for _, row in trans_df.iterrows():
     elif cat == "Consumed":
         summary[item]["Consumed_Qty"] += qty
         summary[item]["Consumed_AMT"] += amt
-    else:
+    elif cat == "Other":
         summary[item]["Other_Qty"] += qty
         summary[item]["Other_AMT"] += amt
+    # Ignored (N/J) 不计入任何 MTD 列
 
 # ── 计算期末余额 ──
 print("\n📊 汇总计算结果：")
@@ -121,7 +122,7 @@ for item, data in sorted(summary.items()):
           f"{data['Consumed_AMT']:>12.2f} {data['Other_AMT']:>12.2f} {balance:>12.2f}")
 
 print("=" * 100)
-print("\n💡 验证公式：期末余额 = 期初 + Received - Consumed - Other")
+print("\n💡 验证公式：期末余额 = 期初 + Received + Consumed + Other（Consumed/Other 按源数据符号）")
 
 # ── 导出 Excel ──
 print("\n📤 导出演示 Excel...")

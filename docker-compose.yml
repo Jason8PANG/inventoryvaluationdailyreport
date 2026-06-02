@@ -4,16 +4,16 @@
 # 使用方式：
 #   docker compose build       # 构建镜像
 #   docker compose up -d       # 启动守护进程
-#     - 每月1日 00:15 自动从 Infor CSI API 生成期初库存文件
-#       (API 不可用时降级为 SQL 直连 SLItems 表)
+#     - 每天 00:00 同步 Inventory + WIP + SLMatltrans
 #     - 每天 09:00 自动运行库存报表并发送邮件
 #   docker compose logs -f     # 查看日志
 #   docker compose down        # 停止（调度随之停止）
 #
 # 首次部署：
-#   docker network create public-net
-#   docker compose build
-#   docker compose up -d
+#   1. docker network create public-net
+#   2. 在项目目录创建 .env（参考 .env.example）
+#   3. docker compose build
+#   4. docker compose up -d
 # ============================================================
 
 version: "3.9"
@@ -28,6 +28,7 @@ services:
     volumes:
       - ./Previous Balance:/app/Previous Balance        # 期初文件（可读写，脚本会自动生成）
       - ./reports:/app/reports                          # 报表输出（可写）
+      - ./output:/app/output                            # 附件输出（可写）
       - ./config.ini:/app/config.ini:ro                 # 配置文件（只读）
 
     # 所有配置通过 .env 注入（优先于 config.ini）
@@ -44,27 +45,18 @@ services:
       - SMTP_USER=${SMTP_USER}
       - SMTP_PASSWORD=${SMTP_PASSWORD}
       - SMTP_TLS=${SMTP_TLS}
-      # 数据库（SQL fallback 用）
+      # 数据库
       - SQL_SERVER_HOST=${SQL_SERVER_HOST}
       - SQL_SERVER_PORT=${SQL_SERVER_PORT}
       - SQL_SERVER_DATABASE=${SQL_SERVER_DATABASE}
       - SQL_SERVER_USERNAME=${SQL_SERVER_USERNAME}
       - SQL_SERVER_PASSWORD=${SQL_SERVER_PASSWORD}
       # Infor CSI API — 期初库存抓取（OAuth2 自动获取 Token）
-      # 推荐配置 OAuth2 凭据（与 csi_datawarehouse 共用）：
-      #   INFOR_AUTH_BASIC = Base64(client_id:client_secret)
-      #   INFOR_USERNAME = Infor 用户名
-      #   INFOR_PASSWORD = Infor 密码
       - INFOR_AUTH_BASIC=${INFOR_AUTH_BASIC}
       - INFOR_USERNAME=${INFOR_USERNAME}
       - INFOR_PASSWORD=${INFOR_PASSWORD}
-      # Token 端点（留空则自动构造）
       - INFOR_TOKEN_URL=${INFOR_TOKEN_URL}
-      # 降级：手动 Bearer Token（不推荐，OAuth2 凭据已配置时可忽略）
-      - INFOR_BEARER_TOKEN=${INFOR_BEARER_TOKEN}
-
-    networks:
-      - public-net
+      - INFOR_BEARER_TOKEN=${INFOR_BEARER_TOKEN:-}
 
 # 外部 Docker 网络（需预先创建：docker network create public-net）
 networks:

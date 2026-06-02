@@ -9,37 +9,40 @@
 ```
 期末金额 Balance = 期初金额(Previous Balance)
                  + Received AMT
-                 - Consumed AMT
-                 - Other Transaction AMT
+                 + Consumed AMT
+                 + Other Transaction AMT
 
-期末数量 = 期初数量 + Received Qty - Consumed Qty - Other Transaction Qty
+期末数量 = 期初数量 + Received Qty + Consumed Qty + Other Transaction Qty
 ```
+
+说明：当前源数据口径中，Consumed 与 Other 通常为负数，
+因此通过“加总带符号金额”即可反映库存减少。
 
 ## 分类规则 (TransType + RefType)
 
 | Category | TransType | RefType | Description |
 |----------|-----------|---------|-------------|
 | **Received** | R | P | PO Receipt |
-| **Received** | W | P | PO Withdraw |
+| **Received** | C | J | Job Complete |
+| **Received** | F | J | Job Finish |
+| **Received** | W | J | Job Return to Whse |
+| **Received** | W | R | RMA Return |
 | **Consumed** | I | J | Job Issue / WIP Change |
-| **Consumed** | W | J | Job Withdrawal / Return |
 | **Consumed** | S | O | Order Ship |
+| **Consumed** | W | P | PO Return to Vendor |
 | **Other Transaction** | A | I | Adjustment |
 | **Other Transaction** | M | I | Stock Move |
 | **Other Transaction** | G | I | Misc Receipt |
 | **Other Transaction** | H | I | Misc Issue |
-| **Other Transaction** | C | J | Job Complete |
-| **Other Transaction** | F | J | Job Finish |
-| **Other Transaction** | N | J | Job Labor / Next Operation |
-| **Other Transaction** | W | R | RMA Withdraw |
+| **Ignored** | N | J | Job Labor / Operation Transfer（不计入任何 MTD 列） |
 
 ## 依赖安装
 
 ```bash
-pip install pandas pyodbc openpyxl
+pip install pandas pymssql openpyxl pyxlsb
 ```
 
-> **注意**：连接 SQL Server 需要安装 [ODBC Driver for SQL Server](https://docs.microsoft.com/zh-cn/sql/connect/odbc/download-odbc-driver-for-sql-server)
+> 注意：当前脚本使用 pymssql 连接 SQL Server，无需安装 ODBC Driver。
 
 ## 使用方法
 
@@ -95,8 +98,8 @@ python inventory_tracking.py \
 | Consumed AMT | 本月消耗金额 |
 | Other Qty | 其他事务数量 |
 | Other AMT | 其他事务金额 |
-| 期末数量 | 期初数量 + Received Qty - Consumed Qty - Other Qty |
-| 期末金额 (Balance) | 期初金额 + Received AMT - Consumed AMT - Other AMT |
+| 期末数量 | 期初数量 + Received Qty + Consumed Qty + Other Qty（按源数据符号） |
+| 期末金额 (Balance) | 期初金额 + Received AMT + Consumed AMT + Other AMT（按源数据符号） |
 
 ## 文件清单
 
@@ -111,3 +114,4 @@ python inventory_tracking.py \
 | 日期 | 版本 | 修改内容 |
 |------|------|----------|
 | 2026-05-25 | v1.0 | 初始版本，支持按 Item 汇总 |
+| 2026-06-02 | v1.1 | 文档口径对齐代码：N/J=Ignored；Consumed/Other 按负号约定参与加总；依赖改为 pymssql |

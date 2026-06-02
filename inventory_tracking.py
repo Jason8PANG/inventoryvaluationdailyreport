@@ -7,7 +7,7 @@
 2. 连接SQL Server查询当月MTD物料事务（使用 pymssql，无需 ODBC 驱动）
 3. 按TransType+RefType分类：Received / Consumed / Other Transaction
 4. 按Item汇总Qty和AMT（金额直接使用 TotalPosted）
-5. 计算期末余额 = 期初 + Received - Consumed - Other
+5. 计算期末余额 = 期初 + Received + Consumed + Other（按源数据符号）
 6. 导出Excel报表（Project Summary + Summary + Detail 三页，Project Summary 在前）
 7. 支持多站点（310/330/410）批量运行
 8. 通过 SMTP 发送邮件（支持内网 Relay，无需 Outlook）
@@ -37,6 +37,7 @@ import json
 import urllib.request
 import urllib.error
 import urllib.parse
+import subprocess
 
 import pymssql
 import pandas as pd
@@ -67,7 +68,7 @@ CATEGORY_MAP: Dict[Tuple[str, str], str] = {
     ("M", "I"): "Other",      # 库存调整
     ("G", "I"): "Other",      # 库存调整
     ("H", "I"): "Other",      # 库存调整
-    ("N", "J"): "Other",      # 工单工序转移
+    ("N", "J"): "Ignored",    # 工单工序转移 — 不计入任何MTD列
 }
 
 TRANS_DESCRIPTIONS: Dict[Tuple[str, str], str] = {
@@ -83,6 +84,7 @@ TRANS_DESCRIPTIONS: Dict[Tuple[str, str], str] = {
     ("M", "I"): "Inventory Adjustment",
     ("G", "I"): "Inventory Adjustment",
     ("H", "I"): "Inventory Adjustment",
+    ("N", "J"): "Job Transfer (Ignored)",
 }
 
 SITE_NAMES = {"310": "Plant1", "330": "Plant2", "410": "PNG"}
@@ -130,22 +132,31 @@ THIN_BORDER = Border(
 class InventoryTracker:
     def __init__(
         self,
-        server: str = r"SUZVPRINT01\CUSTOMSSYS",
-        database: str = "csi_datawarehouse",
-        username: str = "sa",
-        password: str = "xxVcDW9ED24YWX",
+        server: Optional[str] = None,
+        database: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
         port: int = 1433,
         site_ref: str = "310",
         prev_balance_file: Optional[str] = None,
         output_file: Optional[str] = None,
+        as_of_date: Optional[str] = None,
     ):
-        self.server = server
-        self.database = database
-        self.username = username
-        self.password = password
+        # DB 参数统一从调用参数或 .env 读取，禁止硬编码默认账号密码
+        self.server = server or os.environ.get("SQL_SERVER_HOST", "")
+        self.database = database or os.environ.get("SQL_SERVER_DATABASE", "")
+        self.username = username or os.environ.get("SQL_SERVER_USERNAME", "")
+        self.password = password or os.environ.get("SQL_SERVER_PASSWORD", "")
         self.port = port
         self.site_ref = site_ref
         self.prev_balance_file = prev_balance_file
+        if as_of_date:
+            try:
+                self.report_date = datetime.strptime(as_of_date, "%Y-%m-%d")
+            except ValueError as e:
+                raise ValueError("as_of_date 格式错误，应为 YYYY-MM-DD") from e
+        else:
+            self.report_date = datetime.today()
 
         # Currency: site 330 is CNY, convert to USD
         curr_info = SITE_CURRENCY.get(site_ref, ("USD", 1.0))
@@ -154,13 +165,25 @@ class InventoryTracker:
         self.usd_symbol = "$"
 
         site_label = SITE_NAMES.get(site_ref, site_ref)
-        today = datetime.today()
+        today = self.report_date
         self.period_str = today.strftime("%Y-%m")
         default_name = f"Inventory_Balance_{site_label}_{today.strftime('%Y%m')}.xlsx"
         self.output_file = output_file or default_name
 
     def _get_connection(self):
         """使用 pymssql 建立数据库连接（无需 ODBC 驱动）"""
+        missing = []
+        if not self.server:
+            missing.append("SQL_SERVER_HOST")
+        if not self.database:
+            missing.append("SQL_SERVER_DATABASE")
+        if not self.username:
+            missing.append("SQL_SERVER_USERNAME")
+        if not self.password:
+            missing.append("SQL_SERVER_PASSWORD")
+        if missing:
+            raise RuntimeError(f"缺少数据库配置: {', '.join(missing)}（请检查 .env）")
+
         # SQL Server 命名实例格式：host\instance，pymssql 需拆分
         host = self.server
         instance = None
@@ -201,18 +224,79 @@ class InventoryTracker:
             return pd.DataFrame(columns=["Item", "Prev_Qty", "Prev_Balance", "Description"])
 
         filepath = self.prev_balance_file
-        # 自动检测是否需要跳过第一行（site 410 等文件第一行是标题）
-        skip = 0
-        if filepath.lower().endswith(".xlsb"):
-            skip = 1
-        else:
-            # 读取前2行，检查列名是否全为 "Unnamed"（说明第一行是标题行，不是列名）
-            test_df = pd.read_excel(filepath, nrows=2)
-            if all(c.startswith("Unnamed") for c in test_df.columns):
-                skip = 1
+        def _normalize_cols(cols):
+            return [str(c).strip() for c in cols]
 
-        df = pd.read_excel(filepath, skiprows=skip)
-        df.columns = [c.strip() for c in df.columns]
+        def _tok(v):
+            return str(v).strip().lower().replace(" ", "").replace("_", "")
+
+        def _canonicalize_columns(df_in: pd.DataFrame) -> pd.DataFrame:
+            rename_map = {}
+            for c in df_in.columns:
+                t = _tok(c)
+                if t == "item":
+                    rename_map[c] = "Item"
+                elif t == "prevqty":
+                    rename_map[c] = "Prev_Qty"
+                elif t == "prevbalance":
+                    rename_map[c] = "Prev_Balance"
+                elif t == "per":
+                    rename_map[c] = "Per"
+                elif t == "unitscost":
+                    rename_map[c] = "Unitscost"
+                elif t == "unitcost":
+                    rename_map[c] = "Unitcost"
+                elif t == "description":
+                    rename_map[c] = "Description"
+                elif t == "uegdldescription":
+                    rename_map[c] = "ue_GDL_Description"
+            return df_in.rename(columns=rename_map)
+
+        def _has_supported_cols(cols):
+            cset = set(_normalize_cols(cols))
+            return (
+                ("Item" in cset and "Prev_Qty" in cset and "Prev_Balance" in cset)
+                or ("Item" in cset and "Per" in cset and "Unitscost" in cset)
+                or ("Item" in cset and "Per" in cset and "Unitcost" in cset)
+            )
+
+        # 先按默认表头读取；若失败则在所有sheet扫描前60行定位真实表头
+        xls = pd.ExcelFile(filepath)
+        df = None
+        for sheet in xls.sheet_names:
+            candidate = pd.read_excel(filepath, sheet_name=sheet)
+            candidate.columns = _normalize_cols(candidate.columns)
+            candidate = _canonicalize_columns(candidate)
+            if _has_supported_cols(candidate.columns):
+                df = candidate
+                break
+
+            raw = pd.read_excel(filepath, sheet_name=sheet, header=None, nrows=80)
+            header_row = None
+            scan_rows = min(60, len(raw))
+            for ridx in range(scan_rows):
+                row_vals = [_tok(v) for v in raw.iloc[ridx].tolist() if str(v).strip()]
+                has_item = "item" in row_vals
+                has_std = ("prevqty" in row_vals and "prevbalance" in row_vals)
+                has_unit = ("per" in row_vals and "unitcost" in row_vals)
+                has_units = ("per" in row_vals and "unitscost" in row_vals)
+                if has_item and (has_std or has_unit or has_units):
+                    header_row = ridx
+                    break
+
+            if header_row is not None:
+                candidate = pd.read_excel(filepath, sheet_name=sheet, skiprows=header_row)
+                candidate.columns = _normalize_cols(candidate.columns)
+                candidate = _canonicalize_columns(candidate)
+                if _has_supported_cols(candidate.columns):
+                    df = candidate
+                    break
+
+        if df is None:
+            # 用第一个sheet做错误展示，便于快速定位输入文件问题
+            df = pd.read_excel(filepath, sheet_name=xls.sheet_names[0])
+            df.columns = _normalize_cols(df.columns)
+            df = _canonicalize_columns(df)
 
         # 智能识别列名并计算期初金额
         if "Prev_Qty" in df.columns and "Prev_Balance" in df.columns:
@@ -232,7 +316,7 @@ class InventoryTracker:
         else:
             raise ValueError(
                 f"无法识别期初余额列名。现有列：{list(df.columns)}\n"
-                f"需要包含 (Item + Prev_Qty + Prev_Balance) 或 (Item + Per + Unitcost)"
+                f"需要包含 (Item + Prev_Qty + Prev_Balance) 或 (Item + Per + Unitcost/Unitscost)"
             )
 
         df["Item"] = df["Item"].astype(str).str.strip().str.upper()
@@ -271,8 +355,8 @@ class InventoryTracker:
     # 2. 查询数据库（MTD事务）
     # ──────────────────────────────────────────────────────────
     def fetch_mtd_transactions(self) -> pd.DataFrame:
-        today = datetime.today()
-        month_start = today.replace(day=1)
+        today = self.report_date
+        prev_month_end = today.replace(day=1) - timedelta(days=1)
 
         query = f"""
         SELECT
@@ -286,11 +370,12 @@ class InventoryTracker:
             ) AS ProjectCode
         FROM [csi_datawarehouse].[dbo].[SLMatltrans] m
         WHERE m.[SiteRef] = '{self.site_ref}'
-          AND m.[TransDate] >= '{month_start.strftime('%Y-%m-%d')}'
+          AND m.[TransDate] > '{prev_month_end.strftime('%Y-%m-%d')}'
+          AND m.[TransDate] <= '{today.strftime('%Y-%m-%d')}'
         ORDER BY m.[TransDate], m.[TransNum]
         """
 
-        print(f"  📊 查询 {self.database} Site {self.site_ref} 所有物料 (P+M) ({month_start.strftime('%Y-%m-%d')} ~)")
+        print(f"  📊 查询 {self.database} Site {self.site_ref} 所有物料 (P+M) ({prev_month_end.strftime('%Y-%m-%d')} < TransDate <= {today.strftime('%Y-%m-%d')})")
 
         try:
             conn = self._get_connection()
@@ -320,7 +405,8 @@ class InventoryTracker:
     def classify(self, row: pd.Series) -> str:
         key = (str(row.get("TransType", "")).strip().upper(),
                str(row.get("RefType", "")).strip().upper())
-        return CATEGORY_MAP.get(key, "Other")
+        # 严格口径：Other 仅来自 CATEGORY_MAP 显式定义；未映射事务不计入任何 MTD 列
+        return CATEGORY_MAP.get(key, "Ignored")
 
     def _desc(self, tt: str, rt: str) -> str:
         return TRANS_DESCRIPTIONS.get((str(tt).strip().upper(), str(rt).strip().upper()),
@@ -334,6 +420,9 @@ class InventoryTracker:
         trans_df["TransDesc"] = trans_df.apply(
             lambda r: self._desc(r["TransType"], r["RefType"]), axis=1
         )
+        ignored_count = int((trans_df["Category"] == "Ignored").sum())
+        if ignored_count:
+            print(f"  ℹ️  Ignored 事务: {ignored_count:,} 条（未映射或 N/J，不计入 MTD）")
 
         # Detail
         detail_cols = [
@@ -373,7 +462,8 @@ class InventoryTracker:
                 WHERE SiteRef = %s
             """, (self.site_ref,))
             for row in cursor.fetchall():
-                pmtcode_map[str(row["Item"])] = str(row["PMTCode"]).strip() if row["PMTCode"] else ""
+                item_key = str(row["Item"]).strip().upper()
+                pmtcode_map[item_key] = str(row["PMTCode"]).strip() if row["PMTCode"] else ""
             conn.close()
         except Exception as e:
             print(f"  ⚠️  查询 PMTCode 失败：{e}，按 'P' 处理")
@@ -401,8 +491,9 @@ class InventoryTracker:
                 ib.recv_qty += qty; ib.recv_amt += amt
             elif cat == "Consumed":
                 ib.cons_qty += qty; ib.cons_amt += amt
-            else:
+            elif cat == "Other":
                 ib.other_qty += qty; ib.other_amt += amt
+            # "Ignored" 类别（如 N/J 工单转移）直接跳过，不计入任何 MTD 列
 
         summary_data = []
         for item, ib in items.items():
@@ -434,8 +525,10 @@ class InventoryTracker:
     # ──────────────────────────────────────────────────────────
     def export_excel(self, summary_df: pd.DataFrame, detail_df: pd.DataFrame) -> None:
         output_path = Path(self.output_file)
-        today = datetime.today()
+        today = self.report_date
         site_label = SITE_NAMES.get(self.site_ref, self.site_ref)
+        prev_month_end = today.replace(day=1) - timedelta(days=1)
+        prev_label = f"{prev_month_end.month}/{prev_month_end.day}"
 
         # ── 先用 pandas 写入原始数据（快速，无样式）──
         print(f"  📝 导出 ({len(summary_df):,} summary + {len(detail_df):,} detail rows)...")
@@ -468,7 +561,7 @@ class InventoryTracker:
         ws_proj.row_dimensions[1].height = 28
 
         # Row 2: 表头
-        proj_headers = ["Project Code", "4/30 Balance",
+        proj_headers = ["Project Code", f"{prev_label} Balance",
                         "MTD Received", "MTD Consumption", "MTD Other Transaction",
                         "MTD Daily Balance", "公式", ""]
         for col_idx, col_name in enumerate(proj_headers, 1):
@@ -490,7 +583,7 @@ class InventoryTracker:
         for r in range(data_start, data_end + 1):
             ws_proj.cell(row=r, column=7, value=f"=B{r}+C{r}+D{r}+E{r}")
             ws_proj.cell(row=r, column=7).number_format = "#,##0.00"
-            ws_proj.cell(row=r, column=8, value="4/30+Recv+Cons+Other")
+            ws_proj.cell(row=r, column=8, value=f"{prev_label}+Recv+Cons+Other")
             ws_proj.cell(row=r, column=8).font = Font(size=9, color="666666")
             for col_idx in [2, 3, 4, 5, 6]:
                 ws_proj.cell(row=r, column=col_idx).number_format = "#,##0.00"
@@ -538,12 +631,12 @@ class InventoryTracker:
 
         ws.merge_cells("A2:M2")
         ws["A2"] = (f"报告周期：{today.strftime('%Y年%m月')} 1日 - {today.strftime('%m月%d日')}   |   "
-                     f"数据截至：{today.strftime('%Y-%m-%d %H:%M')}   |   "
+                 f"数据截至：{today.strftime('%Y-%m-%d')}   |   "
                      f"含采购物料 (P) + 制造件 (M)")
         ws["A2"].alignment = Alignment(horizontal="center")
         ws["A2"].font = Font(size=10, italic=True, color="666666")
 
-        headers = ["Project Code", "Item", "Description", "4/30 Qty", "4/30 Balance",
+        headers = ["Project Code", "Item", "Description", f"{prev_label} Qty", f"{prev_label} Balance",
                     "MTD Received Qty", "MTD Received", "MTD Consumption Qty", "MTD Consumption",
                     "MTD Other Qty", "MTD Other Transaction", "MTD Daily Balance Qty", "MTD Daily Balance"]
         ws.append(headers)
@@ -685,6 +778,7 @@ def run_all_sites(
     server: str, database: str, username: str, password: str, port: int = 1433,
     prev_dir: str = "Previous Balance", output_dir: Optional[str] = None,
     sites: Optional[List[str]] = None,
+    as_of_date: Optional[str] = None,
 ):
     """批量运行所有站点"""
     if sites is None:
@@ -693,11 +787,39 @@ def run_all_sites(
     # 自动匹配期初文件到站点（优先匹配新命名 site XXX.xlsx）
     prev_files = {"310": None, "330": None, "410": None}
     prev_path = Path(prev_dir)
-    # 第一轮：精确匹配 "site XXX.xlsx"
+
+    # 检查 prev_dir 下是否有日期子目录（如 2026-05-31/site 310.xlsx）
+    # 指定 as_of_date 时优先使用该日期对应的上月月末目录，否则自动选最新目录
+    import re
+    date_dirs = sorted(
+        [d for d in prev_path.iterdir() if d.is_dir() and re.match(r"^\d{4}-\d{2}-\d{2}$", d.name)],
+        reverse=True,
+    )
+    if as_of_date:
+        try:
+            report_date = datetime.strptime(as_of_date, "%Y-%m-%d")
+        except ValueError as e:
+            raise ValueError("as_of_date 格式错误，应为 YYYY-MM-DD") from e
+        target_prev_eom = (report_date.replace(day=1) - timedelta(days=1)).strftime("%Y-%m-%d")
+        candidate = prev_path / target_prev_eom
+        if candidate.exists() and candidate.is_dir():
+            prev_path = candidate
+            print(f"  📁 使用指定日期对应期初目录: {prev_path.name}")
+        elif date_dirs:
+            prev_path = date_dirs[0]
+            print(f"  ⚠️  未找到目录 {target_prev_eom}，回退到最新期初目录: {prev_path.name}")
+    elif date_dirs:
+        prev_path = date_dirs[0]
+        print(f"  📁 使用最新期初目录: {prev_path.name}")
+
+    # 第一轮：精确匹配 "site XXX.xlsx/.xlsb"
     for site in ["310", "330", "410"]:
-        exact = prev_path / f"site {site}.xlsx"
-        if exact.exists():
-            prev_files[site] = str(exact)
+        exact_xlsx = prev_path / f"site {site}.xlsx"
+        exact_xlsb = prev_path / f"site {site}.xlsb"
+        if exact_xlsx.exists():
+            prev_files[site] = str(exact_xlsx)
+        elif exact_xlsb.exists():
+            prev_files[site] = str(exact_xlsb)
     # 第二轮：模糊匹配旧命名 (Plant1/Plant2/PNG)
     if not all(prev_files.values()):
         for f in prev_path.iterdir():
@@ -714,6 +836,7 @@ def run_all_sites(
     out_dir = Path(output_dir) if output_dir else Path(".")
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    report_date = datetime.strptime(as_of_date, "%Y-%m-%d") if as_of_date else datetime.today()
     all_summaries = {}
     for site in sites:
         pf = prev_files.get(site)
@@ -725,7 +848,8 @@ def run_all_sites(
             server=server, database=database,
             username=username, password=password, port=port,
             site_ref=site, prev_balance_file=pf,
-            output_file=str(out_dir / f"Inventory_Balance_{SITE_NAMES.get(site, site)}_{datetime.today().strftime('%Y%m')}.xlsx"),
+            output_file=str(out_dir / f"Inventory_Balance_{SITE_NAMES.get(site, site)}_{report_date.strftime('%Y%m')}.xlsx"),
+            as_of_date=as_of_date,
         )
         summary_df, detail_df = tracker.run()
         summary_df["Site"] = site
@@ -766,6 +890,23 @@ def run_all_sites(
         print(f"    RM  (P): 期初=${rm['prev']:,.2f} +Recv=${rm['recv']:,.2f} +Cons=${rm['cons']:,.2f} +Other=${rm['other']:,.2f} =${rm['bal']:,.2f}")
         print(f"    FG  (M): 期初=${fg['prev']:,.2f} +Recv=${fg['recv']:,.2f} +Cons=${fg['cons']:,.2f} +Other=${fg['other']:,.2f} =${fg['bal']:,.2f}")
 
+    # ── Daily Balance 以数据库快照为准（SLTotalInventory, BalanceDate=as_of_date）──
+    inv_daily_bal = fetch_inventory_daily_balances(
+        sites=list(all_summaries.keys()),
+        as_of_date=report_date.strftime("%Y-%m-%d"),
+        db_config={
+            "server": server,
+            "database": database,
+            "username": username,
+            "password": password,
+            "port": port,
+        },
+    )
+    for site in all_summaries:
+        snap = inv_daily_bal.get(site, {})
+        site_breakdown[site]["RM"]["bal"] = snap.get("rm")
+        site_breakdown[site]["FG"]["bal"] = snap.get("fg")
+
     # 保留旧版 group_totals（兼容 Excel 等）
     group_totals = combined.groupby("Site").agg(
         Items=("Item", "count"),
@@ -787,8 +928,18 @@ def run_all_sites(
           f"= ${grand_bal:,.2f}")
 
     # ── 获取 WIP 数据 ──
-    wip_totals = fetch_wip_totals(sites=list(all_summaries.keys()))
-    grand_wip = sum(wip_totals.values())
+    wip_totals = fetch_wip_totals(
+        sites=list(all_summaries.keys()),
+        as_of_date=report_date.strftime("%Y-%m-%d"),
+        db_config={
+            "server": server,
+            "database": database,
+            "username": username,
+            "password": password,
+            "port": port,
+        },
+    )
+    grand_wip = sum(v for v in wip_totals.values() if v is not None)
     print(f"\n  📦 WIP Grand Total (USD): ${grand_wip:,.2f}")
 
     return {
@@ -799,7 +950,76 @@ def run_all_sites(
         "grand_bal": grand_bal, "out_dir": out_dir,
         "wip_totals": wip_totals, "grand_wip": grand_wip,
         "site_breakdown": site_breakdown,
+        "report_date": report_date.strftime("%Y-%m-%d"),
     }
+
+
+# ──────────────────────────────────────────────────────────────
+# 从数据库动态读取上期库存余额
+# ──────────────────────────────────────────────────────────────
+def fetch_prev_balance_from_db(server, username, password, database, port,
+                                site_ref: str, target_date: str) -> dict:
+    """
+    从 SLTotalInventory 表读取指定日期、站点的 RM/FG 汇总金额。
+
+    参数:
+        target_date: 日期字符串，如 "2026-04-30"
+    返回:
+        {"rm": float, "fg": float}
+        RM  = SUM(Unitscost) WHERE Source = 'Purchased'
+        FG  = SUM(Unitscost) WHERE Source = 'Manufactured'
+    """
+    result = {"rm": 0.0, "fg": 0.0}
+    try:
+        conn = _db_connect(server, username, password, database, port)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT Source, ISNULL(SUM(Unitscost), 0) AS TotalAmt
+            FROM dbo.SLTotalInventory
+            WHERE SiteRef = %s AND BalanceDate = %s
+            GROUP BY Source
+        """, (site_ref, target_date))
+        for row in cur.fetchall():
+            src = str(row[0]).strip().upper()
+            amt = float(row[1]) if row[1] else 0.0
+            if src == "PURCHASED":
+                result["rm"] = amt
+            elif src == "MANUFACTURED":
+                result["fg"] = amt
+        conn.close()
+    except Exception as e:
+        print(f"  ⚠️  查询上期库存失败 (Site {site_ref}, {target_date}): {e}")
+    return result
+
+
+def fetch_prev_wip_from_db(server, username, password, database, port,
+                           site_ref: str, target_date: str) -> float:
+    """
+    从 SLTotalWIPValueByAcountReport 表读取指定日期、站点的 WIP 汇总金额。
+
+    参数:
+        target_date: 日期字符串，如 "2026-05-31"
+    返回:
+        WIP 总金额 (float)
+    """
+    try:
+        conn = _db_connect(server, username, password, database, port)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT ISNULL(SUM(AcctTot), 0) AS WipTotal
+            FROM dbo.SLTotalWIPValueByAcountReport
+            WHERE SiteRef = %s AND BalanceDate = %s
+        """, (site_ref, target_date))
+        row = cur.fetchone()
+        conn.close()
+        wip_total = float(row[0]) if row and row[0] else 0.0
+        # Site 330 原始口径为 CNY，邮件展示统一 USD
+        if site_ref == "330":
+            wip_total = wip_total * SITE_CURRENCY["330"][1]
+        return wip_total
+    except Exception as e:
+        print(f"  ⚠️  查询上期 WIP 失败 (Site {site_ref}, {target_date}): {e}")
+        return 0.0
 
 
 # ──────────────────────────────────────────────────────────────
@@ -815,6 +1035,8 @@ def send_summary_email(
     smtp_password: str = "",
     smtp_tls: bool = False,
     from_addr: str = "inventory-report@nai-group.com",
+    db_config: dict | None = None,
+    report_date: Optional[str] = None,
 ):
     """生成固定格式的 HTML 邮件并通过 SMTP 发送
 
@@ -840,22 +1062,46 @@ def send_summary_email(
             return f"-${abs(v):,.2f}"
         return f"${v:,.2f}"
 
-    today = datetime.today()
+    if report_date:
+        try:
+            today = datetime.strptime(report_date, "%Y-%m-%d")
+        except ValueError as e:
+            raise ValueError("report_date 格式错误，应为 YYYY-MM-DD") from e
+    else:
+        today = datetime.today()
     month_label = today.strftime("%B %Y")
     date_label = today.strftime("%B %d %Y")
     prev_month = (today.replace(day=1) - timedelta(days=1))
     prev_eom_label = prev_month.strftime("%m/%d")
 
-    # 5/30 上期 WIP 数据（用于 WIP Balance 列）
-    PREV_MONTH_WIP = {
-        "310": 200903.16,
-        "330": 3717.76,
-        "410": 157920.87,
-    }
+    # ── 上月月末日期（用于上期 WIP，如 5/31）──
+    prev_date_str = prev_month.strftime("%Y-%m-%d")
 
-    # ── 构建每个站点的独立表格 ──
-    tables_html = ""
+    # ── 动态从数据库读取上期 WIP（用于上个月 Balance 列）──
+    PREV_MONTH_WIP = {}  # {site: float}
     all_sites = ["310", "330", "410"]
+
+    if db_config:
+        print(f"  📊 从数据库读取上期 WIP ({prev_eom_label} = {prev_date_str})...")
+        for site in all_sites:
+            wip_val = fetch_prev_wip_from_db(
+                db_config["server"], db_config["username"], db_config["password"],
+                db_config["database"], db_config.get("port", 1433),
+                site, prev_date_str,
+            )
+            PREV_MONTH_WIP[site] = wip_val
+            print(f"    Site {site}: WIP={wip_val:,.2f}")
+    else:
+        # 无数据库配置时使用硬编码 fallback（兼容旧调用方式）
+        print("  ⚠️  未提供 db_config，使用硬编码上期 WIP")
+        PREV_MONTH_WIP = {
+            "310": 200903.16,
+            "330": 543.63,
+            "410": 157920.87,
+        }
+
+    tables_html = ""
+
     for site in all_sites:
         if site not in site_breakdown:
             continue
@@ -863,15 +1109,22 @@ def send_summary_email(
         sd = site_breakdown[site]
         rm = sd.get("RM", {})
         fg = sd.get("FG", {})
-        wip_bal = wip_totals.get(site, 0.0)
+        rm_bal = rm.get("bal")
+        fg_bal = fg.get("bal")
+        wip_bal = wip_totals.get(site)
         prev_wip = PREV_MONTH_WIP.get(site, 0.0)
-
         # 计算 Total 行
         t_prev = rm.get("prev", 0.0) + fg.get("prev", 0.0) + prev_wip
         t_recv = rm.get("recv", 0.0) + fg.get("recv", 0.0)
         t_cons = rm.get("cons", 0.0) + fg.get("cons", 0.0)
         t_other = rm.get("other", 0.0) + fg.get("other", 0.0)
-        t_bal = rm.get("bal", 0.0) + fg.get("bal", 0.0) + wip_bal
+        t_bal = (rm_bal + fg_bal + wip_bal) if (rm_bal is not None and fg_bal is not None and wip_bal is not None) else None
+
+        # MTD Variances = Daily Balance - prev Balance - (Received + Consumed + Other)
+        rm_var = (rm_bal - rm.get("prev", 0.0) - (rm.get("recv", 0.0) + rm.get("cons", 0.0) + rm.get("other", 0.0))) if rm_bal is not None else None
+        fg_var = (fg_bal - fg.get("prev", 0.0) - (fg.get("recv", 0.0) + fg.get("cons", 0.0) + fg.get("other", 0.0))) if fg_bal is not None else None
+        wip_var = (wip_bal - prev_wip) if wip_bal is not None else None  # WIP 没有事务列
+        t_var = (t_bal - t_prev - (t_recv + t_cons + t_other)) if t_bal is not None else None
 
         label = f"{site} ({SITE_NAMES.get(site, site)})"
         site_color = {"310": "#1F4E79", "330": "#1F4E79", "410": "#1F4E79"}[site]
@@ -879,14 +1132,15 @@ def send_summary_email(
         tables_html += f"""
 <p style="margin-top:18px"><b>{label} — {date_label}</b></p>
 <table border="1" cellpadding="5" cellspacing="0"
-  style="border-collapse:collapse;font-size:10pt;text-align:right;width:100%;max-width:900px">
+  style="border-collapse:collapse;font-size:10pt;text-align:right;width:100%;max-width:1050px">
 <tr style="background-color:{site_color};color:white;text-align:center">
-  <th style="width:16%;text-align:left">&nbsp;</th>
-  <th style="width:18%">{prev_eom_label} Balance</th>
-  <th style="width:18%">MTD Received</th>
-  <th style="width:18%">MTD Consumed</th>
-  <th style="width:18%">MTD Other Transaction</th>
-  <th style="width:18%">MTD Daily Balance</th>
+  <th style="width:12%;text-align:left">&nbsp;</th>
+    <th style="width:14%">{prev_eom_label} Balance</th>
+  <th style="width:12%">MTD Received</th>
+  <th style="width:12%">MTD Consumed</th>
+  <th style="width:12%">MTD Other Transaction</th>
+  <th style="width:12%">MTD Variances</th>
+    <th style="width:14%">MTD Daily Balance</th>
 </tr>
 <tr>
   <td style="text-align:left;font-weight:bold">RM</td>
@@ -894,7 +1148,8 @@ def send_summary_email(
   <td>{fmt_num(rm.get('recv', 0))}</td>
   <td>{fmt_num(rm.get('cons', 0))}</td>
   <td>{fmt_num(rm.get('other', 0))}</td>
-  <td><b>{fmt_num(rm.get('bal', 0))}</b></td>
+  <td>{fmt_num(rm_var)}</td>
+    <td><b>{fmt_num(rm_bal)}</b></td>
 </tr>
 <tr>
   <td style="text-align:left;font-weight:bold">FG/Semi FG</td>
@@ -902,14 +1157,16 @@ def send_summary_email(
   <td>{fmt_num(fg.get('recv', 0))}</td>
   <td>{fmt_num(fg.get('cons', 0))}</td>
   <td>{fmt_num(fg.get('other', 0))}</td>
-  <td><b>{fmt_num(fg.get('bal', 0))}</b></td>
+  <td>{fmt_num(fg_var)}</td>
+    <td><b>{fmt_num(fg_bal)}</b></td>
 </tr>
 <tr style="background-color:#FFF2CC">
   <td style="text-align:left;font-weight:bold">WIP</td>
   <td>{fmt_num(prev_wip)}</td>
-  <td>0</td>
-  <td>0</td>
-  <td>0</td>
+  <td>&nbsp;</td>
+  <td>&nbsp;</td>
+  <td>&nbsp;</td>
+  <td>{fmt_num(wip_var)}</td>
   <td><b>{fmt_num(wip_bal)}</b></td>
 </tr>
 <tr style="background-color:#D6E4F0;font-weight:bold">
@@ -918,6 +1175,7 @@ def send_summary_email(
   <td>{fmt_num(t_recv)}</td>
   <td>{fmt_num(t_cons)}</td>
   <td>{fmt_num(t_other)}</td>
+  <td>{fmt_num(t_var)}</td>
   <td><b>{fmt_num(t_bal)}</b></td>
 </tr>
 </table>
@@ -928,34 +1186,44 @@ def send_summary_email(
     asia_rm_recv = sum(site_breakdown.get(s, {}).get("RM", {}).get("recv", 0) for s in all_sites)
     asia_rm_cons = sum(site_breakdown.get(s, {}).get("RM", {}).get("cons", 0) for s in all_sites)
     asia_rm_other = sum(site_breakdown.get(s, {}).get("RM", {}).get("other", 0) for s in all_sites)
-    asia_rm_bal = sum(site_breakdown.get(s, {}).get("RM", {}).get("bal", 0) for s in all_sites)
+    asia_rm_bal_vals = [site_breakdown.get(s, {}).get("RM", {}).get("bal") for s in all_sites]
+    asia_rm_bal = sum(v for v in asia_rm_bal_vals if v is not None) if all(v is not None for v in asia_rm_bal_vals) else None
 
     asia_fg_prev = sum(site_breakdown.get(s, {}).get("FG", {}).get("prev", 0) for s in all_sites)
     asia_fg_recv = sum(site_breakdown.get(s, {}).get("FG", {}).get("recv", 0) for s in all_sites)
     asia_fg_cons = sum(site_breakdown.get(s, {}).get("FG", {}).get("cons", 0) for s in all_sites)
     asia_fg_other = sum(site_breakdown.get(s, {}).get("FG", {}).get("other", 0) for s in all_sites)
-    asia_fg_bal = sum(site_breakdown.get(s, {}).get("FG", {}).get("bal", 0) for s in all_sites)
+    asia_fg_bal_vals = [site_breakdown.get(s, {}).get("FG", {}).get("bal") for s in all_sites]
+    asia_fg_bal = sum(v for v in asia_fg_bal_vals if v is not None) if all(v is not None for v in asia_fg_bal_vals) else None
 
-    asia_wip_bal = sum(wip_totals.get(s, 0.0) for s in all_sites)
+    asia_wip_vals = [wip_totals.get(s) for s in all_sites]
+    asia_wip_bal = sum(v for v in asia_wip_vals if v is not None) if any(v is not None for v in asia_wip_vals) else None
 
     asia_prev_wip = sum(PREV_MONTH_WIP.get(s, 0.0) for s in all_sites)
     asia_t_prev = asia_rm_prev + asia_fg_prev + asia_prev_wip
     asia_t_recv = asia_rm_recv + asia_fg_recv
     asia_t_cons = asia_rm_cons + asia_fg_cons
     asia_t_other = asia_rm_other + asia_fg_other
-    asia_t_bal = asia_rm_bal + asia_fg_bal + asia_wip_bal
+    asia_t_bal = (asia_rm_bal + asia_fg_bal + asia_wip_bal) if (asia_rm_bal is not None and asia_fg_bal is not None and asia_wip_bal is not None) else None
+
+    # Asia Total MTD Variances
+    asia_rm_var = (asia_rm_bal - asia_rm_prev - (asia_rm_recv + asia_rm_cons + asia_rm_other)) if asia_rm_bal is not None else None
+    asia_fg_var = (asia_fg_bal - asia_fg_prev - (asia_fg_recv + asia_fg_cons + asia_fg_other)) if asia_fg_bal is not None else None
+    asia_wip_var = (asia_wip_bal - asia_prev_wip) if asia_wip_bal is not None else None
+    asia_t_var = (asia_t_bal - asia_t_prev - (asia_t_recv + asia_t_cons + asia_t_other)) if asia_t_bal is not None else None
 
     tables_html += f"""
 <p style="margin-top:24px"><b>Asia Total — {date_label}</b></p>
 <table border="1" cellpadding="5" cellspacing="0"
-  style="border-collapse:collapse;font-size:10pt;text-align:right;width:100%;max-width:900px">
+  style="border-collapse:collapse;font-size:10pt;text-align:right;width:100%;max-width:1050px">
 <tr style="background-color:#4472C4;color:white;text-align:center">
-  <th style="width:16%;text-align:left">&nbsp;</th>
-  <th style="width:18%">{prev_eom_label} Balance</th>
-  <th style="width:18%">MTD Received</th>
-  <th style="width:18%">MTD Consumed</th>
-  <th style="width:18%">MTD Other Transaction</th>
-  <th style="width:18%">MTD Daily Balance</th>
+  <th style="width:12%;text-align:left">&nbsp;</th>
+    <th style="width:14%">{prev_eom_label} Balance</th>
+  <th style="width:12%">MTD Received</th>
+  <th style="width:12%">MTD Consumed</th>
+  <th style="width:12%">MTD Other Transaction</th>
+  <th style="width:12%">MTD Variances</th>
+  <th style="width:14%">MTD Daily Balance</th>
 </tr>
 <tr>
   <td style="text-align:left;font-weight:bold">RM</td>
@@ -963,6 +1231,7 @@ def send_summary_email(
   <td>{fmt_num(asia_rm_recv)}</td>
   <td>{fmt_num(asia_rm_cons)}</td>
   <td>{fmt_num(asia_rm_other)}</td>
+  <td>{fmt_num(asia_rm_var)}</td>
   <td><b>{fmt_num(asia_rm_bal)}</b></td>
 </tr>
 <tr>
@@ -971,14 +1240,16 @@ def send_summary_email(
   <td>{fmt_num(asia_fg_recv)}</td>
   <td>{fmt_num(asia_fg_cons)}</td>
   <td>{fmt_num(asia_fg_other)}</td>
+  <td>{fmt_num(asia_fg_var)}</td>
   <td><b>{fmt_num(asia_fg_bal)}</b></td>
 </tr>
 <tr style="background-color:#FFF2CC">
   <td style="text-align:left;font-weight:bold">WIP</td>
   <td>{fmt_num(asia_prev_wip)}</td>
-  <td>0</td>
-  <td>0</td>
-  <td>0</td>
+  <td>&nbsp;</td>
+  <td>&nbsp;</td>
+  <td>&nbsp;</td>
+  <td>{fmt_num(asia_wip_var)}</td>
   <td><b>{fmt_num(asia_wip_bal)}</b></td>
 </tr>
 <tr style="background-color:#4472C4;color:white;font-weight:bold">
@@ -987,6 +1258,7 @@ def send_summary_email(
   <td>{fmt_num(asia_t_recv)}</td>
   <td>{fmt_num(asia_t_cons)}</td>
   <td>{fmt_num(asia_t_other)}</td>
+  <td>{fmt_num(asia_t_var)}</td>
   <td><b>{fmt_num(asia_t_bal)}</b></td>
 </tr>
 </table>
@@ -995,7 +1267,7 @@ def send_summary_email(
     html_body = f"""<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt">
 <p>Below is the {month_label} Inventory Valuation Tracking Report.
 <br>All amounts in USD. Site 330 CNY amounts converted at rate 6.838784.
-<br>WIP values are fetched dynamically via Infor CSI API.</p>
+<br>Daily Balance values (RM/FG/WIP) are snapshot-based from DB by BalanceDate. If snapshot missing: historical dates stay blank, today may auto-sync.</p>
 {tables_html}
 </div>"""
 
@@ -1062,28 +1334,26 @@ def send_summary_email(
 # ──────────────────────────────────────────────────────────────
 
 # Infor CSI API 站点参数配置
-# clmParam 格式：M,PMT,B,ABC,0,1,,,,,,,0,0,{site}
-# 第二个字段 PMTCode 留空 = 包含所有物料类型（采购件 P + 制造件 M）
-# 期初库存与 MTD 事务查询均包含所有物料类型（P+M），口径一致
+# clmParam 格式：M,PM,V,ABC,0,T,,,,,,,0,0,{site}
+# M=制造, PM=PMTCode(采购件P+制造件M), V=Valuation, ABC=ABC分类, T=Include all, {site}=站点
 INFOR_API_BASE = "https://mingle-ionapi.inforcloudsuite.com"
 INFOR_TENANT = "NAIGROUP_PRD"
 INFOR_IDO = "SLItemCostingReport"
 INFOR_REPORT_PROC = "Rpt_ItemCostingSp"
-INFOR_PROPERTIES = "Item,Itemdesc,Units,Unitcost,Unitscost"
+INFOR_PROPERTIES = "Seq,RptSeq,Item,Itemdesc,Units,Unitcost,Unitscost,Pmtcode,Prodcode"
 
 # 每个站点的 clmParam 及 MongooseConfig header
-# 格式说明：M=制造 / PMT=采购类型 / B=选 / ABC=ABC分类 / 0,1=参数占位 / 最后参数=SiteRef
 SITE_API_CONFIG = {
     "310": {
-        "clmParam": "M,,,B,ABC,0,1,,,,,,,0,0,310",
+        "clmParam": "M,PM,V,ABC,0,T,,,,,,,0,0,310",
         "mongoose_config": "NAIGROUP_PRD_310",
     },
     "330": {
-        "clmParam": "M,,,B,ABC,0,1,,,,,,,0,0,330",
+        "clmParam": "M,PM,V,ABC,0,T,,,,,,,0,0,330",
         "mongoose_config": "NAIGROUP_PRD_330",
     },
     "410": {
-        "clmParam": "M,,,B,ABC,0,1,,,,,,,0,0,410",
+        "clmParam": "M,PM,V,ABC,0,T,,,,,,,0,0,410",
         "mongoose_config": "NAIGROUP_PRD_410",
     },
 }
@@ -1123,6 +1393,7 @@ SITE_WIP_CONFIG = {
 # ── Infor OAuth2 Token 缓存（模块级，进程生命周期内有效）────────
 _infor_token_cache: str | None = None
 _infor_token_expires_at: float = 0.0
+_daily_snapshot_synced_dates: set[str] = set()
 
 
 def _read_infor_config() -> dict:
@@ -1299,8 +1570,9 @@ def _fetch_infor_site(site_ref: str, token: str, token_expired_retry: bool = Fal
     url = (
         f"{INFOR_API_BASE}/{INFOR_TENANT}/CSI/IDORequestService/ido/load/{INFOR_IDO}"
         f"?clm={INFOR_REPORT_PROC}"
-        f"&properties={INFOR_PROPERTIES}"
         f"&clmParam={clm_param}"
+        f"&readonly=true"
+        f"&properties={INFOR_PROPERTIES}"
     )
 
     headers = {
@@ -1354,8 +1626,10 @@ def _fetch_infor_site(site_ref: str, token: str, token_expired_retry: bool = Fal
             f"   原始响应前 500 字符：{raw[:500]}"
         ) from e
 
-    # IDO 响应格式：{"Items": {"Items": [{"PropValue": [v1, v2, ...]}, ...]}}
-    # 或：{"Items": [{"PropValue": [v1, v2, ...]}, ...]}
+    # API 返回格式（平铺 JSON）：
+    # {"Items": [{"Seq":"6054","RptSeq":"1","Item":"K000023","Itemdesc":"...","Units":"1714480.00000000",
+    #   "Unitcost":"0.12800000","Unitscost":"219453.44000000","Pmtcode":"P","Prodcode":"M-Equipmnt"}, ...]}
+    # 注意：API 直接返回 Pmtcode 和 Prodcode，无需额外 enrich
     rows = []
     props = INFOR_PROPERTIES.split(",")
 
@@ -1367,10 +1641,10 @@ def _fetch_infor_site(site_ref: str, token: str, token_expired_retry: bool = Fal
             raise ValueError(f"响应结构异常，Items 不是列表: {type(item_list)}")
 
         for record in item_list:
-            values = record.get("PropValue", [])
-            if len(values) < len(props):
-                values += [""] * (len(props) - len(values))
-            row = dict(zip(props, values))
+            # API 返回平铺 key-value，直接取值
+            row = {}
+            for prop in props:
+                row[prop] = record.get(prop, "")
             rows.append(row)
 
     except Exception as e:
@@ -1384,15 +1658,14 @@ def _fetch_infor_site(site_ref: str, token: str, token_expired_retry: bool = Fal
 
     if df.empty:
         print(f"  ⚠️  Site {site_ref}: 未返回数据（可能 clmParam 参数有误或站点无库存物料）")
-        return pd.DataFrame(columns=["Item", "Description", "Per", "Unitcost", "Unitscost"])
+        return pd.DataFrame(columns=["Item", "Description", "Per", "Unitcost", "Unitscost", "ProductCode", "Source"])
 
     # 列名标准化
-    # Units   → Per       (库存数量)
-    # Unitcost → Unitcost  (标准单价，保留原名)
-    # Unitscost → Unitscost (扩展金额 = Units × Unitcost，API 直接提供，无需计算)
     df = df.rename(columns={
         "Itemdesc":  "Description",
         "Units":     "Per",
+        "Prodcode":  "ProductCode",
+        "Pmtcode":   "Source",
     })
 
     df["Item"]      = df["Item"].astype(str).str.strip().str.upper()
@@ -1400,19 +1673,29 @@ def _fetch_infor_site(site_ref: str, token: str, token_expired_retry: bool = Fal
     df["Per"]       = pd.to_numeric(df["Per"],       errors="coerce").round(8).fillna(0)
     df["Unitcost"]  = pd.to_numeric(df["Unitcost"],  errors="coerce").round(8).fillna(0)
     df["Unitscost"] = pd.to_numeric(df["Unitscost"], errors="coerce").round(8).fillna(0)
+    if "ProductCode" in df.columns:
+        df["ProductCode"] = df["ProductCode"].astype(str).str.strip()
+    if "Source" in df.columns:
+        df["Source"] = df["Source"].astype(str).str.strip()
+        # Pmtcode 映射：P → Purchased, M → Manufactured
+        df["Source"] = df["Source"].map(
+            lambda v: {"P": "Purchased", "M": "Manufactured"}.get(v, v)
+        )
 
     # 只保留有扩展金额的行（Unitscost != 0）
     df = df[df["Unitscost"] != 0].copy()
 
-    return df[["Item", "Description", "Per", "Unitcost", "Unitscost"]]
+    return df[["Item", "Description", "Per", "Unitcost", "Unitscost", "ProductCode", "Source"]]
 
 
-def _fetch_wip_site(site_ref: str, token: str, token_expired_retry: bool = False) -> float:
+def _fetch_wip_site(site_ref: str, token: str, token_expired_retry: bool = False) -> tuple:
     """
-    调用 Infor CSI IDO API 获取指定站点的 WIP 总金额（AcctTot 汇总行合计）。
+    调用 Infor CSI IDO API 获取指定站点的 WIP 数据。
 
-    返回 float：该站点 WIP 的 AcctTot 合计（原始货币，330 为 CNY）。
-    调用方负责货币换算。
+    返回 (total, records)：
+      total   = float，AcctTot 汇总行合计（原始货币，330 为 CNY）
+      records = list[dict]，每条明细记录的 JobAcct, Des, AcctTot 等字段
+    调用方负责货币换算和入库。
 
     token_expired_retry=True 时表示已在重试中，不再重试 401。
     """
@@ -1474,54 +1757,293 @@ def _fetch_wip_site(site_ref: str, token: str, token_expired_retry: bool = False
         ) from e
 
     # 解析 IDO 响应
-    # 响应格式：{"Items": [{"JobAcct": "140200", "AcctTot": "208474.97", "IsDetail": "0", ...}, ...]}
-    # 直接用属性名作为 key 读取，不走 PropValue 数组路径
     item_list = data.get("Items", [])
     if not isinstance(item_list, list):
         raise ValueError(f"响应结构异常，Items 不是列表: {type(item_list)}")
 
     if not item_list:
         print(f"  ⚠️  WIP Site {site_ref}: 未返回数据，金额视为 0")
-        return 0.0
+        return (0.0, [])
 
-    # 累加所有汇总行（IsDetail == 0 或空）的 AcctTot
+    # 分离汇总行和明细行
     total = 0.0
+    summary_records = []  # 汇总行（IsDetail==0），用于写入 SLTotalWIPValueByAcountReport
     for record in item_list:
         is_detail = str(record.get("IsDetail", "")).strip()
+        acct_tot_val = record.get("AcctTot")
+        try:
+            acct_tot = float(acct_tot_val) if acct_tot_val not in ("", None) else 0.0
+        except (ValueError, TypeError):
+            acct_tot = 0.0
+
         if is_detail in ("", "0", "false", "False"):
-            val = record.get("AcctTot")
-            try:
-                total += float(val) if val not in ("", None) else 0.0
-            except (ValueError, TypeError):
-                pass
+            total += acct_tot
+            summary_records.append({
+                "JobAcct": str(record.get("JobAcct", "")).strip() or None,
+                "Des": str(record.get("Des", "")).strip() or None,
+                "AcctTot": acct_tot,
+            })
 
-    print(f"  ✅ WIP Site {site_ref}: AcctTot 合计 = {total:,.2f}")
-    return total
+    print(f"  ✅ WIP Site {site_ref}: AcctTot 合计 = {total:,.2f} ({len(summary_records)} 汇总行)")
+    return (total, summary_records)
 
 
-def fetch_wip_totals(sites: Optional[List[str]] = None) -> Dict[str, float]:
+def _fetch_wip_totals_from_db(
+    sites: List[str],
+    balance_date: str,
+    server: str,
+    username: str,
+    password: str,
+    database: str,
+    port: int = 1433,
+) -> Dict[str, Optional[float]]:
+    """从 SLTotalWIPValueByAcountReport 读取指定日期 WIP（USD）。缺失站点返回 None。"""
+    result: Dict[str, Optional[float]] = {s: None for s in sites}
+    try:
+        conn = _db_connect(server, username, password, database, port)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT SiteRef, ISNULL(SUM(AcctTot), 0) AS WipTotal
+            FROM dbo.SLTotalWIPValueByAcountReport
+            WHERE BalanceDate = %s AND SiteRef IN (%s, %s, %s)
+            GROUP BY SiteRef
+            """,
+            (balance_date, "310", "330", "410"),
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        for site_ref, wip_total in rows:
+            site = str(site_ref).strip()
+            if site not in result:
+                continue
+            val = float(wip_total) if wip_total is not None else 0.0
+            _, fx = SITE_CURRENCY.get(site, ("USD", 1.0))
+            result[site] = round(val * fx, 2)
+    except Exception as e:
+        print(f"  ⚠️  从数据库读取 WIP 失败 (BalanceDate={balance_date})：{e}")
+
+    return result
+
+
+def _fetch_inventory_balances_from_db(
+    sites: List[str],
+    balance_date: str,
+    server: str,
+    username: str,
+    password: str,
+    database: str,
+    port: int = 1433,
+) -> Dict[str, Dict[str, Optional[float]]]:
+    """从 SLTotalInventory 读取指定日期 RM/FG Daily Balance（USD）。缺失站点返回 None。"""
+    result: Dict[str, Dict[str, Optional[float]]] = {
+        s: {"rm": None, "fg": None} for s in sites
+    }
+    try:
+        conn = _db_connect(server, username, password, database, port)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT SiteRef, Source, ISNULL(SUM(Unitscost), 0) AS TotalAmt
+            FROM dbo.SLTotalInventory
+            WHERE BalanceDate = %s AND SiteRef IN (%s, %s, %s)
+            GROUP BY SiteRef, Source
+            """,
+            (balance_date, "310", "330", "410"),
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        seen_sites: set[str] = set()
+        for site_ref, source, total_amt in rows:
+            site = str(site_ref).strip()
+            if site not in result:
+                continue
+            if site not in seen_sites:
+                result[site] = {"rm": 0.0, "fg": 0.0}
+                seen_sites.add(site)
+
+            val = float(total_amt) if total_amt is not None else 0.0
+            _, fx = SITE_CURRENCY.get(site, ("USD", 1.0))
+            usd_val = round(val * fx, 2)
+            src = str(source).strip().upper()
+            if src == "PURCHASED":
+                result[site]["rm"] = usd_val
+            elif src == "MANUFACTURED":
+                result[site]["fg"] = usd_val
+    except Exception as e:
+        print(f"  ⚠️  从数据库读取 Total Inventory 失败 (BalanceDate={balance_date})：{e}")
+
+    return result
+
+
+def _run_daily_snapshot_once(balance_date: str) -> bool:
+    """按日期触发一次 daily_inventory_snapshot.py，同日期重复调用会跳过。"""
+    if balance_date in _daily_snapshot_synced_dates:
+        return True
+
+    try:
+        snapshot_script = Path(__file__).with_name("daily_inventory_snapshot.py")
+        cmd = [sys.executable, str(snapshot_script), "--balance-date", balance_date]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if proc.returncode == 0:
+            _daily_snapshot_synced_dates.add(balance_date)
+            print("  ✅ daily_inventory_snapshot.py 同步完成")
+            return True
+        print("  ⚠️  daily_inventory_snapshot.py 同步失败")
+        if proc.stdout:
+            print(proc.stdout[-1000:])
+        if proc.stderr:
+            print(proc.stderr[-1000:])
+        return False
+    except Exception as e:
+        print(f"  ⚠️  触发 daily_inventory_snapshot.py 失败：{e}")
+        return False
+
+
+def fetch_inventory_daily_balances(
+    sites: Optional[List[str]] = None,
+    as_of_date: Optional[str] = None,
+    db_config: Optional[dict] = None,
+) -> Dict[str, Dict[str, Optional[float]]]:
+    """
+    获取 RM/FG 的 MTD Daily Balance（USD）。
+    规则：
+    - 先读 SLTotalInventory(BalanceDate=as_of_date)
+    - 若 as_of_date < 今天 且站点缺失：保留空白(None)
+    - 若 as_of_date = 今天 且站点缺失：自动触发 daily_inventory_snapshot.py 后重查
+    """
+    if sites is None:
+        sites = ["310", "330", "410"]
+    result = {s: {"rm": None, "fg": None} for s in sites}
+    if not db_config:
+        return result
+
+    report_dt = datetime.strptime(as_of_date, "%Y-%m-%d") if as_of_date else datetime.today()
+    balance_date = report_dt.strftime("%Y-%m-%d")
+    today_str = datetime.today().strftime("%Y-%m-%d")
+
+    print(f"\n📦 读取 Total Inventory 快照 (BalanceDate={balance_date})...")
+    inv_db = _fetch_inventory_balances_from_db(
+        sites=sites,
+        balance_date=balance_date,
+        server=db_config["server"],
+        username=db_config["username"],
+        password=db_config["password"],
+        database=db_config["database"],
+        port=db_config.get("port", 1433),
+    )
+
+    missing_sites = [s for s in sites if inv_db.get(s, {}).get("rm") is None and inv_db.get(s, {}).get("fg") is None]
+    if not missing_sites:
+        print("  ✅ Total Inventory 快照齐全")
+        return inv_db
+
+    if balance_date < today_str:
+        print(f"  ⚠️  Total Inventory 快照缺失站点: {missing_sites}（历史日期，保持空白）")
+        return inv_db
+
+    if balance_date == today_str:
+        print(f"  🔄 当天 Total Inventory 快照缺失站点: {missing_sites}，尝试自动同步...")
+        _run_daily_snapshot_once(balance_date)
+        inv_db_retry = _fetch_inventory_balances_from_db(
+            sites=sites,
+            balance_date=balance_date,
+            server=db_config["server"],
+            username=db_config["username"],
+            password=db_config["password"],
+            database=db_config["database"],
+            port=db_config.get("port", 1433),
+        )
+        remain_missing = [s for s in sites if inv_db_retry.get(s, {}).get("rm") is None and inv_db_retry.get(s, {}).get("fg") is None]
+        if remain_missing:
+            print(f"  ⚠️  同步后 Total Inventory 仍缺失站点: {remain_missing}（保持空白）")
+        return inv_db_retry
+
+    return inv_db
+
+
+def fetch_wip_totals(
+    sites: Optional[List[str]] = None,
+    as_of_date: Optional[str] = None,
+    db_config: Optional[dict] = None,
+) -> Dict[str, Optional[float]]:
     """
     获取各站点 WIP 总金额（USD）。
     - 310 / 410：API 返回 USD，直接使用
     - 330：API 返回 CNY，按 ÷6.838784 换算 USD
 
-    返回 {site_ref: wip_usd_amount}
-    失败的站点以 0.0 填充（不阻断主流程）。
+    返回 {site_ref: wip_usd_amount or None}
+    - 有值：该站点 WIP（USD）
+    - None：该日期无快照（历史日期保留空白；当天同步失败时也保留空白）
     """
     if sites is None:
         sites = ["310", "330", "410"]
 
+    report_dt = datetime.strptime(as_of_date, "%Y-%m-%d") if as_of_date else datetime.today()
+    balance_date = report_dt.strftime("%Y-%m-%d")
+    today_str = datetime.today().strftime("%Y-%m-%d")
+
+    # 1) 先按 as-of-date 读数据库快照
+    if db_config:
+        print(f"\n📦 读取 WIP 快照 (BalanceDate={balance_date})...")
+        wip_db = _fetch_wip_totals_from_db(
+            sites=sites,
+            balance_date=balance_date,
+            server=db_config["server"],
+            username=db_config["username"],
+            password=db_config["password"],
+            database=db_config["database"],
+            port=db_config.get("port", 1433),
+        )
+        missing_sites = [s for s in sites if wip_db.get(s) is None]
+        if not missing_sites:
+            grand = sum(v for v in wip_db.values() if v is not None)
+            print(f"  ✅ WIP 快照齐全，Grand Total (USD): ${grand:,.2f}")
+            return wip_db
+
+        # 2) 历史日期缺失：保留空白，不回落 API
+        if balance_date < today_str:
+            print(f"  ⚠️  WIP 快照缺失站点: {missing_sites}（历史日期，保持空白）")
+            grand = sum(v for v in wip_db.values() if v is not None)
+            print(f"  📊 WIP Grand Total (USD, available only): ${grand:,.2f}")
+            return wip_db
+
+        # 3) 当天缺失：尝试调用 daily_inventory_snapshot.py 同步后再读一次
+        if balance_date == today_str:
+            print(f"  🔄 当天 WIP 快照缺失站点: {missing_sites}，尝试自动同步 daily_inventory_snapshot.py ...")
+            _run_daily_snapshot_once(balance_date)
+            print("  🔁 重新读取 WIP 快照...")
+
+            wip_db_retry = _fetch_wip_totals_from_db(
+                sites=sites,
+                balance_date=balance_date,
+                server=db_config["server"],
+                username=db_config["username"],
+                password=db_config["password"],
+                database=db_config["database"],
+                port=db_config.get("port", 1433),
+            )
+            remain_missing = [s for s in sites if wip_db_retry.get(s) is None]
+            if remain_missing:
+                print(f"  ⚠️  同步后仍缺失站点: {remain_missing}（保持空白）")
+            grand = sum(v for v in wip_db_retry.values() if v is not None)
+            print(f"  📊 WIP Grand Total (USD, available only): ${grand:,.2f}")
+            return wip_db_retry
+
+    # 无 db_config 时保留原有 API 逻辑（向后兼容）
     print("\n📦 获取 WIP 数据...")
     try:
         token = _load_infor_token()
     except RuntimeError as e:
         print(f"  ❌ WIP Token 获取失败：{e}")
-        return {s: 0.0 for s in sites}
+        return {s: None for s in sites}
 
-    wip_totals: Dict[str, float] = {}
+    wip_totals: Dict[str, Optional[float]] = {}
     for site_ref in sites:
         try:
-            raw_total = _fetch_wip_site(site_ref, token)
+            raw_total, _ = _fetch_wip_site(site_ref, token)
             # 330 是 CNY，换算 USD
             _, fx = SITE_CURRENCY.get(site_ref, ("USD", 1.0))
             usd_total = raw_total * fx
@@ -1529,10 +2051,10 @@ def fetch_wip_totals(sites: Optional[List[str]] = None) -> Dict[str, float]:
                 print(f"  💱 WIP Site {site_ref}: CNY {raw_total:,.2f} → USD {usd_total:,.2f}")
             wip_totals[site_ref] = round(usd_total, 2)
         except RuntimeError as e:
-            print(f"  ❌ WIP Site {site_ref} 获取失败：{e}\n     金额记为 0")
-            wip_totals[site_ref] = 0.0
+            print(f"  ❌ WIP Site {site_ref} 获取失败：{e}\n     金额留空")
+            wip_totals[site_ref] = None
 
-    grand_wip = sum(wip_totals.values())
+    grand_wip = sum(v for v in wip_totals.values() if v is not None)
     print(f"  📊 WIP Grand Total (USD): ${grand_wip:,.2f}")
     return wip_totals
 
@@ -1603,6 +2125,130 @@ def _enrich_with_slitems(df: pd.DataFrame, site_ref: str,
         df["Sourcing"] = ""
 
     return df
+
+
+def save_inventory_to_db(df: pd.DataFrame, site_ref: str,
+                          server, username, password, database, port=1433,
+                          balance_date: Optional[str] = None) -> int:
+    """
+    将 API 获取的库存数据写入 SLTotalInventory 表。
+    同一 BalanceDate + SiteRef 只保留最新一次数据（先删后插）。
+
+    df 列：Item, Description, Per, Unitcost, Unitscost, [ProductCode], [Sourcing]
+    返回插入行数。
+    """
+    if df.empty:
+        return 0
+
+    balance_date = balance_date or datetime.now().strftime("%Y-%m-%d")
+    create_date = datetime.now()
+
+    # 列名映射：Sourcing → Source（表字段名为 Source）
+    col_product = "ProductCode" if "ProductCode" in df.columns else None
+    col_source = "Sourcing" if "Sourcing" in df.columns else "Source"
+
+    rows = []
+    for _, row in df.iterrows():
+        rows.append((
+            str(row["Item"]).strip(),
+            str(row.get("Description", "")).strip() or None,
+            float(row["Per"]) if pd.notna(row["Per"]) else None,
+            float(row["Unitcost"]) if pd.notna(row["Unitcost"]) else None,
+            float(row["Unitscost"]) if pd.notna(row["Unitscost"]) else None,
+            str(row[col_product]).strip() if col_product and pd.notna(row.get(col_product)) else None,
+            str(row[col_source]).strip() if col_source and pd.notna(row.get(col_source)) else None,
+            site_ref,
+            balance_date,
+            create_date,
+        ))
+
+    try:
+        conn = _db_connect(server, username, password, database, port)
+        cur = conn.cursor()
+        # 先删除同一天同站点的旧数据，确保只保留最新快照
+        cur.execute(
+            "DELETE FROM dbo.SLTotalInventory WHERE SiteRef = %s AND BalanceDate = %s",
+            (site_ref, balance_date),
+        )
+        deleted = cur.rowcount
+        cur.executemany(
+            "INSERT INTO dbo.SLTotalInventory "
+            "(Item, [Description], Per, Unitcost, Unitscost, ProductCode, Source, SiteRef, BalanceDate, CreateDate) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            rows,
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        msg = f"  💾 Site {site_ref}: {len(rows)} 行写入 SLTotalInventory (BalanceDate={balance_date})"
+        if deleted:
+            msg += f" [替换 {deleted} 行旧数据]"
+        print(msg)
+        return len(rows)
+    except Exception as e:
+        print(f"  ⚠️  Site {site_ref}: 写入数据库失败 ({e})，不影响主流程")
+        return 0
+
+
+def save_wip_to_db(site_ref: str, wip_raw_amount: float, wip_records: list,
+                    server, username, password, database, port=1433,
+                    balance_date: Optional[str] = None) -> bool:
+    """
+    将单站点 WIP 数据写入 SLTotalWIPValueByAcountReport 表。
+    同一 BalanceDate + SiteRef 只保留最新一次数据（先删后插）。
+
+    wip_raw_amount: API 返回的原始合计金额（用于日志）
+    wip_records: list[dict]，每条含 JobAcct, Des, AcctTot（汇总行明细）
+    返回 True 表示写入成功。
+    """
+    balance_date = balance_date or datetime.now().strftime("%Y-%m-%d")
+    create_date = datetime.now()
+
+    try:
+        conn = _db_connect(server, username, password, database, port)
+        cur = conn.cursor()
+
+        # 先删除同一天同站点的旧数据
+        cur.execute(
+            "DELETE FROM dbo.SLTotalWIPValueByAcountReport WHERE SiteRef = %s AND BalanceDate = %s",
+            (site_ref, balance_date),
+        )
+
+        if wip_records:
+            rows = []
+            for rec in wip_records:
+                rows.append((
+                    site_ref,
+                    balance_date,
+                    rec.get("JobAcct"),
+                    rec.get("Des"),
+                    round(rec["AcctTot"], 8),
+                    create_date,
+                ))
+            cur.executemany(
+                "INSERT INTO dbo.SLTotalWIPValueByAcountReport "
+                "(SiteRef, BalanceDate, JobAcct, Des, AcctTot, CreateDate) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                rows,
+            )
+            print(f"  💾 WIP Site {site_ref}: {len(rows)} 条汇总行写入 SLTotalWIPValueByAcountReport (BalanceDate={balance_date})")
+        else:
+            # 即使没有明细行，也插入一条合计记录（JobAcct/Des 为 NULL）
+            cur.execute(
+                "INSERT INTO dbo.SLTotalWIPValueByAcountReport "
+                "(SiteRef, BalanceDate, JobAcct, Des, AcctTot, CreateDate) "
+                "VALUES (%s, %s, NULL, NULL, %s, %s)",
+                (site_ref, balance_date, round(wip_raw_amount, 8), create_date),
+            )
+            print(f"  💾 WIP Site {site_ref}: 合计 {wip_raw_amount:,.2f} 写入 SLTotalWIPValueByAcountReport (BalanceDate={balance_date})")
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"  ⚠️  WIP Site {site_ref}: 写入数据库失败 ({e})，不影响主流程")
+        return False
 
 
 def _fetch_opening_via_sql(server, username, password, database, port=1433) -> pd.DataFrame:
@@ -1687,14 +2333,17 @@ def generate_opening_balance(
                 api_failed_sites.append(site_ref)
                 continue
 
-            # 从 SLItems 关联 ProductCode / Sourcing
-            if server:
-                df = _enrich_with_slitems(df, site_ref, server, username, password, database, port)
-            else:
+            # API 已直接返回 ProductCode 和 Source（Pmtcode/Prodcode），无需额外 enrich
+            if "ProductCode" not in df.columns:
                 df["ProductCode"] = ""
-                df["Sourcing"] = ""
+            if "Source" not in df.columns:
+                df["Source"] = ""
 
             _write_opening_excel(df, site_ref, out_path, site_info, results)
+
+            # 写入数据库（不删除旧数据，仅新增）
+            if server:
+                save_inventory_to_db(df, site_ref, server, username, password, database, port)
 
         # 对 API 失败的站点尝试 SQL fallback
         if api_failed_sites and server:
@@ -1774,8 +2423,8 @@ def _write_opening_excel(df: pd.DataFrame, site_ref: str, out_path: Path,
 # ──────────────────────────────────────────────────────────────
 # 守护进程 — 每月1日 00:15 生成期初 + 每天 09:00 跑报表
 # ──────────────────────────────────────────────────────────────
-DAEMON_HOUR_OPENING = 0
-DAEMON_MINUTE_OPENING = 15
+DAEMON_HOUR_SNAPSHOT = 0
+DAEMON_MINUTE_SNAPSHOT = 0
 DAEMON_HOUR_REPORT = 9
 DAEMON_MINUTE_REPORT = 0
 
@@ -1783,20 +2432,20 @@ def _next_schedule(now):
     """
     计算下一次执行时间和任务类型。
     规则：
-      - 每月1日 00:15：生成期初库存文件
+      - 每天 00:00：同步 daily_inventory_snapshot.py（Inventory + WIP + SLMatltrans）
       - 每天 09:00：运行库存跟踪报表
-    返回 (target_datetime, task_type)  task_type = 'opening' | 'report'
+    返回 (target_datetime, task_type)  task_type = 'snapshot' | 'report'
     """
     def _make(hour, minute):
         return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-    today_opening = _make(DAEMON_HOUR_OPENING, DAEMON_MINUTE_OPENING)
+    today_snapshot = _make(DAEMON_HOUR_SNAPSHOT, DAEMON_MINUTE_SNAPSHOT)
     today_report = _make(DAEMON_HOUR_REPORT, DAEMON_MINUTE_REPORT)
 
     candidates = []
-    # 每月1日 00:15 生成期初
-    if now.day == 1 and now < today_opening:
-        candidates.append((today_opening, "opening"))
+    # 每天 00:00 同步 snapshot
+    if now < today_snapshot:
+        candidates.append((today_snapshot, "snapshot"))
     # 每天 09:00 跑报表
     if now < today_report:
         candidates.append((today_report, "report"))
@@ -1806,35 +2455,27 @@ def _next_schedule(now):
 
     # 今天的任务都过了，看明天
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    if tomorrow.day == 1:
-        return (tomorrow.replace(hour=DAEMON_HOUR_OPENING, minute=DAEMON_MINUTE_OPENING), "opening")
-    else:
-        return (tomorrow.replace(hour=DAEMON_HOUR_REPORT, minute=DAEMON_MINUTE_REPORT), "report")
+    return (tomorrow.replace(hour=DAEMON_HOUR_SNAPSHOT, minute=DAEMON_MINUTE_SNAPSHOT), "snapshot")
 
 
 def schedule_loop(run_func, args):
     """
     双调度守护进程：
-      - 每月1日 00:15：自动生成期初库存文件（优先 Infor CSI API，降级 SQL）
+      - 每天 00:00：同步 daily_inventory_snapshot.py（Inventory + WIP + SLMatltrans）
       - 每天 09:00：运行库存跟踪报表 + 发邮件
     Docker 停止时收到 SIGTERM 自然退出。
     """
-    gen_args = dict(
-        server=args.server, username=args.username,
-        password=args.password, database=args.database,
-        port=args.db_port, output_dir=args.prev_dir,
-        use_api=True,
-    )
 
     print(f"⏰ Daemon mode started:")
-    print(f"   每月1日 {DAEMON_HOUR_OPENING:02d}:{DAEMON_MINUTE_OPENING:02d} → 生成期初库存文件")
+    print(f"   每天   {DAEMON_HOUR_SNAPSHOT:02d}:{DAEMON_MINUTE_SNAPSHOT:02d} → 同步 Inventory + WIP + SLMatltrans")
     print(f"   每天   {DAEMON_HOUR_REPORT:02d}:{DAEMON_MINUTE_REPORT:02d} → 运行库存跟踪报表")
 
     while True:
         target, task_type = _next_schedule(datetime.now())
         wait_seconds = (target - datetime.now()).total_seconds()
 
-        label = "生成期初库存" if task_type == "opening" else "运行库存报表"
+        task_labels = {"snapshot": "同步数据快照", "report": "运行库存报表"}
+        label = task_labels.get(task_type, task_type)
         print(f"⏳ Next: {target.strftime('%Y-%m-%d %H:%M:%S')} [{label}] ({wait_seconds/3600:.1f}h)")
 
         try:
@@ -1844,13 +2485,24 @@ def schedule_loop(run_func, args):
             break
 
         try:
-            if task_type == "opening":
+            if task_type == "snapshot":
                 print(f"\n{'='*60}")
-                print(f"  🔄 定时任务：生成期初库存文件")
+                print(f"  🔄 定时任务：同步 daily_inventory_snapshot.py")
                 print(f"{'='*60}")
-                generate_opening_balance(**gen_args)
-                # 生成期初后，当天 09:00 还会自动跑报表
-            else:
+                snapshot_script = Path(__file__).with_name("daily_inventory_snapshot.py")
+                balance_date = datetime.now().strftime("%Y-%m-%d")
+                cmd = [sys.executable, str(snapshot_script), "--balance-date", balance_date]
+                print(f"  📋 执行: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                if result.stdout:
+                    print(result.stdout)
+                if result.returncode != 0:
+                    print(f"  ⚠️  snapshot 退出码 {result.returncode}")
+                    if result.stderr:
+                        print(f"  STDERR: {result.stderr[:500]}")
+                else:
+                    print(f"  ✅ daily_inventory_snapshot.py 同步完成")
+            elif task_type == "report":
                 run_func(args)
         except Exception as e:
             print(f"❌ Scheduled run failed: {e}")
@@ -1866,6 +2518,7 @@ def run_once(args):
             server=args.server, database=args.database,
             username=args.username, password=args.password, port=args.db_port,
             prev_dir=args.prev_dir, output_dir=args.output_dir,
+            as_of_date=args.as_of_date or None,
         )
         if result and not args.no_email:
             print("\n📧 发送汇总邮件...")
@@ -1879,11 +2532,25 @@ def run_once(args):
                 smtp_password=args.smtp_password,
                 smtp_tls=args.smtp_tls,
                 from_addr=args.email_from,
+                db_config={
+                    "server": args.server,
+                    "database": args.database,
+                    "username": args.username,
+                    "password": args.password,
+                    "port": args.db_port,
+                },
+                report_date=args.as_of_date or result.get("report_date"),
             )
         return result
     else:
         if not args.prev_file:
             prev_dir = Path(args.prev_dir)
+            if args.as_of_date:
+                target_prev_eom = (datetime.strptime(args.as_of_date, "%Y-%m-%d").replace(day=1) - timedelta(days=1)).strftime("%Y-%m-%d")
+                candidate_dir = prev_dir / target_prev_eom
+                if candidate_dir.exists() and candidate_dir.is_dir():
+                    prev_dir = candidate_dir
+                    print(f"  📁 使用指定日期对应期初目录: {prev_dir.name}")
             site_label = SITE_NAMES.get(args.site, args.site)
             for f in prev_dir.iterdir():
                 if site_label.upper() in f.name.upper() or args.site in f.name:
@@ -1898,6 +2565,7 @@ def run_once(args):
             username=args.username, password=args.password, port=args.db_port,
             site_ref=args.site, prev_balance_file=args.prev_file,
             output_file=args.output,
+            as_of_date=args.as_of_date or None,
         )
         return tracker.run()
 
@@ -1925,9 +2593,9 @@ def main():
         """,
     )
     # 数据库
-    parser.add_argument("-s", "--server",   default=os.environ.get("SQL_SERVER_HOST",     r"SUZVPRINT01\CUSTOMSSYS"))
-    parser.add_argument("-d", "--database", default=os.environ.get("SQL_SERVER_DATABASE", "csi_datawarehouse"))
-    parser.add_argument("-u", "--username", default=os.environ.get("SQL_SERVER_USERNAME", "sa"))
+    parser.add_argument("-s", "--server",   default=os.environ.get("SQL_SERVER_HOST", ""))
+    parser.add_argument("-d", "--database", default=os.environ.get("SQL_SERVER_DATABASE", ""))
+    parser.add_argument("-u", "--username", default=os.environ.get("SQL_SERVER_USERNAME", ""))
     parser.add_argument("-p", "--password", default=os.environ.get("SQL_SERVER_PASSWORD", ""))
     parser.add_argument("--db-port", type=int, default=int(os.environ.get("SQL_SERVER_PORT", 1433)))
     # 模式
@@ -1940,6 +2608,7 @@ def main():
     parser.add_argument("--prev-dir", default=os.environ.get("PREV_DIR", "Previous Balance"))
     parser.add_argument("--output-dir", default=os.environ.get("OUTPUT_DIR", None))
     parser.add_argument("-o", "--output", help="输出文件名 (单站点模式)")
+    parser.add_argument("--as-of-date", default="", help="模拟报表日期，格式 YYYY-MM-DD")
     # 邮件
     parser.add_argument("--no-email", action="store_true", help="不发送邮件")
     parser.add_argument("--email-to",
@@ -1958,6 +2627,27 @@ def main():
 
     args = parser.parse_args()
 
+    if args.as_of_date:
+        try:
+            datetime.strptime(args.as_of_date, "%Y-%m-%d")
+        except ValueError:
+            print("❌ --as-of-date 格式错误，应为 YYYY-MM-DD")
+            sys.exit(1)
+
+    missing_db = []
+    if not args.server:
+        missing_db.append("SQL_SERVER_HOST")
+    if not args.database:
+        missing_db.append("SQL_SERVER_DATABASE")
+    if not args.username:
+        missing_db.append("SQL_SERVER_USERNAME")
+    if not args.password:
+        missing_db.append("SQL_SERVER_PASSWORD")
+    if missing_db:
+        print(f"❌ 缺少数据库配置: {', '.join(missing_db)}")
+        print("   请在 .env 中配置后重试。")
+        sys.exit(1)
+
     if args.generate_opening:
         # 手动生成期初模式（优先 Infor CSI API，降级 SQL）
         generate_opening_balance(
@@ -1967,6 +2657,9 @@ def main():
             use_api=not args.no_api,
         )
     elif args.daemon:
+        if args.as_of_date:
+            print("❌ 守护模式不支持固定 --as-of-date，请去掉该参数。")
+            sys.exit(1)
         # 守护模式：双调度（每月1日 00:15 期初 + 每天 09:00 报表）
         schedule_loop(lambda a: run_once(a), args)
     else:
