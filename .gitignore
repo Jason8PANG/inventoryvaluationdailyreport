@@ -6,11 +6,22 @@ config.ini
 # Python
 __pycache__/
 *.pyc
+*.py.bak
 
 # 输出报表（每次运行生成，不入库）
 reports/
+output/
 *.xlsx
+*.xlsb
+*.html
 !prev_balance_sample.xlsx
+
+# 临时分析脚本
+investigate_*.py
+analyze_*.py
+verify_*.py
+read_prev_*.py
+consolidated_report*.py
 
 # 调试日志
 debug.log

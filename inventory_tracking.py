@@ -1338,25 +1338,6 @@ def send_summary_email(
 # M=制造, PM=PMTCode(采购件P+制造件M), V=Valuation, ABC=ABC分类, T=Include all, {site}=站点
 INFOR_API_BASE = "https://mingle-ionapi.inforcloudsuite.com"
 INFOR_TENANT = "NAIGROUP_PRD"
-INFOR_IDO = "SLItemCostingReport"
-INFOR_REPORT_PROC = "Rpt_ItemCostingSp"
-INFOR_PROPERTIES = "Seq,RptSeq,Item,Itemdesc,Units,Unitcost,Unitscost,Pmtcode,Prodcode"
-
-# 每个站点的 clmParam 及 MongooseConfig header
-SITE_API_CONFIG = {
-    "310": {
-        "clmParam": "M,PM,V,ABC,0,T,,,,,,,0,0,310",
-        "mongoose_config": "NAIGROUP_PRD_310",
-    },
-    "330": {
-        "clmParam": "M,PM,V,ABC,0,T,,,,,,,0,0,330",
-        "mongoose_config": "NAIGROUP_PRD_330",
-    },
-    "410": {
-        "clmParam": "M,PM,V,ABC,0,T,,,,,,,0,0,410",
-        "mongoose_config": "NAIGROUP_PRD_410",
-    },
-}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1557,135 +1538,6 @@ def _load_infor_token(force_refresh: bool = False) -> str:
         "      Python: base64.b64encode(b'client_id:client_secret').decode()\n"
     )
 
-
-def _fetch_infor_site(site_ref: str, token: str, token_expired_retry: bool = False) -> pd.DataFrame:
-    """
-    调用 Infor CSI IDO API 获取指定站点的库存成本报告（Purchased Material）。
-    返回 DataFrame，列：Item, Itemdesc, Prodcode, Units, Unitcost
-
-    token_expired_retry=True 时表示已在重试中，不再重试 401。
-    """
-    site_cfg = SITE_API_CONFIG[site_ref]
-    clm_param = urllib.parse.quote(site_cfg["clmParam"], safe="")
-    url = (
-        f"{INFOR_API_BASE}/{INFOR_TENANT}/CSI/IDORequestService/ido/load/{INFOR_IDO}"
-        f"?clm={INFOR_REPORT_PROC}"
-        f"&clmParam={clm_param}"
-        f"&readonly=true"
-        f"&properties={INFOR_PROPERTIES}"
-    )
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "X-Infor-MongooseConfig": site_cfg["mongoose_config"],
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-
-    print(f"  🌐 调用 Infor API: Site {site_ref} ({site_cfg['mongoose_config']})...")
-
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        if e.code == 401 and not token_expired_retry:
-            # Token 过期 → 强制刷新后重试一次
-            print(f"  🔄 Site {site_ref}: Token 过期 (401)，强制刷新...")
-            new_token = _load_infor_token(force_refresh=True)
-            return _fetch_infor_site(site_ref, new_token, token_expired_retry=True)
-        elif e.code == 401:
-            raise RuntimeError(
-                f"❌ Infor API 认证失败 (401) - Site {site_ref}\n"
-                f"   Token 刷新后仍然无效，请检查 OAuth2 凭据"
-            ) from e
-        elif e.code == 502:
-            raise RuntimeError(
-                f"❌ Infor API 502 Bad Gateway - Site {site_ref}\n"
-                f"   可能原因：VPN 未连接、Infor CloudSuite 服务暂时不可用\n"
-                f"   响应：{body[:300]}"
-            ) from e
-        else:
-            raise RuntimeError(
-                f"❌ Infor API HTTP {e.code} - Site {site_ref}\n"
-                f"   响应：{body[:300]}"
-            ) from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(
-            f"❌ 网络连接失败 - Site {site_ref}: {e.reason}\n"
-            f"   请检查 VPN 或网络连接"
-        ) from e
-
-    # 解析 JSON
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(
-            f"❌ Infor API 返回非 JSON 内容 - Site {site_ref}: {e}\n"
-            f"   原始响应前 500 字符：{raw[:500]}"
-        ) from e
-
-    # API 返回格式（平铺 JSON）：
-    # {"Items": [{"Seq":"6054","RptSeq":"1","Item":"K000023","Itemdesc":"...","Units":"1714480.00000000",
-    #   "Unitcost":"0.12800000","Unitscost":"219453.44000000","Pmtcode":"P","Prodcode":"M-Equipmnt"}, ...]}
-    # 注意：API 直接返回 Pmtcode 和 Prodcode，无需额外 enrich
-    rows = []
-    props = INFOR_PROPERTIES.split(",")
-
-    try:
-        item_list = data.get("Items", {})
-        if isinstance(item_list, dict):
-            item_list = item_list.get("Items", [])
-        if not isinstance(item_list, list):
-            raise ValueError(f"响应结构异常，Items 不是列表: {type(item_list)}")
-
-        for record in item_list:
-            # API 返回平铺 key-value，直接取值
-            row = {}
-            for prop in props:
-                row[prop] = record.get(prop, "")
-            rows.append(row)
-
-    except Exception as e:
-        raise RuntimeError(
-            f"❌ Infor API 响应解析失败 - Site {site_ref}: {e}\n"
-            f"   响应结构：{str(data)[:500]}"
-        ) from e
-
-    df = pd.DataFrame(rows, columns=props)
-    print(f"  ✅ Site {site_ref}: API 返回 {len(df)} 条记录")
-
-    if df.empty:
-        print(f"  ⚠️  Site {site_ref}: 未返回数据（可能 clmParam 参数有误或站点无库存物料）")
-        return pd.DataFrame(columns=["Item", "Description", "Per", "Unitcost", "Unitscost", "ProductCode", "Source"])
-
-    # 列名标准化
-    df = df.rename(columns={
-        "Itemdesc":  "Description",
-        "Units":     "Per",
-        "Prodcode":  "ProductCode",
-        "Pmtcode":   "Source",
-    })
-
-    df["Item"]      = df["Item"].astype(str).str.strip().str.upper()
-    df["Description"] = df["Description"].astype(str).str.strip()
-    df["Per"]       = pd.to_numeric(df["Per"],       errors="coerce").round(8).fillna(0)
-    df["Unitcost"]  = pd.to_numeric(df["Unitcost"],  errors="coerce").round(8).fillna(0)
-    df["Unitscost"] = pd.to_numeric(df["Unitscost"], errors="coerce").round(8).fillna(0)
-    if "ProductCode" in df.columns:
-        df["ProductCode"] = df["ProductCode"].astype(str).str.strip()
-    if "Source" in df.columns:
-        df["Source"] = df["Source"].astype(str).str.strip()
-        # Pmtcode 映射：P → Purchased, M → Manufactured
-        df["Source"] = df["Source"].map(
-            lambda v: {"P": "Purchased", "M": "Manufactured"}.get(v, v)
-        )
-
-    # 只保留有扩展金额的行（Unitscost != 0）
-    df = df[df["Unitscost"] != 0].copy()
-
-    return df[["Item", "Description", "Per", "Unitcost", "Unitscost", "ProductCode", "Source"]]
 
 
 def _fetch_wip_site(site_ref: str, token: str, token_expired_retry: bool = False) -> tuple:
@@ -2060,7 +1912,7 @@ def fetch_wip_totals(
 
 
 def _db_connect(server, username, password, database, port=1433):
-    """独立的数据库连接函数（供 generate_opening_balance SQL fallback 使用）"""
+    """独立的数据库连接函数（供 WIP/库存同步使用）"""
     host = server
     instance = None
     if "\\" in host:
@@ -2127,68 +1979,6 @@ def _enrich_with_slitems(df: pd.DataFrame, site_ref: str,
     return df
 
 
-def save_inventory_to_db(df: pd.DataFrame, site_ref: str,
-                          server, username, password, database, port=1433,
-                          balance_date: Optional[str] = None) -> int:
-    """
-    将 API 获取的库存数据写入 SLTotalInventory 表。
-    同一 BalanceDate + SiteRef 只保留最新一次数据（先删后插）。
-
-    df 列：Item, Description, Per, Unitcost, Unitscost, [ProductCode], [Sourcing]
-    返回插入行数。
-    """
-    if df.empty:
-        return 0
-
-    balance_date = balance_date or datetime.now().strftime("%Y-%m-%d")
-    create_date = datetime.now()
-
-    # 列名映射：Sourcing → Source（表字段名为 Source）
-    col_product = "ProductCode" if "ProductCode" in df.columns else None
-    col_source = "Sourcing" if "Sourcing" in df.columns else "Source"
-
-    rows = []
-    for _, row in df.iterrows():
-        rows.append((
-            str(row["Item"]).strip(),
-            str(row.get("Description", "")).strip() or None,
-            float(row["Per"]) if pd.notna(row["Per"]) else None,
-            float(row["Unitcost"]) if pd.notna(row["Unitcost"]) else None,
-            float(row["Unitscost"]) if pd.notna(row["Unitscost"]) else None,
-            str(row[col_product]).strip() if col_product and pd.notna(row.get(col_product)) else None,
-            str(row[col_source]).strip() if col_source and pd.notna(row.get(col_source)) else None,
-            site_ref,
-            balance_date,
-            create_date,
-        ))
-
-    try:
-        conn = _db_connect(server, username, password, database, port)
-        cur = conn.cursor()
-        # 先删除同一天同站点的旧数据，确保只保留最新快照
-        cur.execute(
-            "DELETE FROM dbo.SLTotalInventory WHERE SiteRef = %s AND BalanceDate = %s",
-            (site_ref, balance_date),
-        )
-        deleted = cur.rowcount
-        cur.executemany(
-            "INSERT INTO dbo.SLTotalInventory "
-            "(Item, [Description], Per, Unitcost, Unitscost, ProductCode, Source, SiteRef, BalanceDate, CreateDate) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            rows,
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
-        msg = f"  💾 Site {site_ref}: {len(rows)} 行写入 SLTotalInventory (BalanceDate={balance_date})"
-        if deleted:
-            msg += f" [替换 {deleted} 行旧数据]"
-        print(msg)
-        return len(rows)
-    except Exception as e:
-        print(f"  ⚠️  Site {site_ref}: 写入数据库失败 ({e})，不影响主流程")
-        return 0
-
 
 def save_wip_to_db(site_ref: str, wip_raw_amount: float, wip_records: list,
                     server, username, password, database, port=1433,
@@ -2251,177 +2041,10 @@ def save_wip_to_db(site_ref: str, wip_raw_amount: float, wip_records: list,
         return False
 
 
-def _fetch_opening_via_sql(server, username, password, database, port=1433) -> pd.DataFrame:
-    """
-    SQL Fallback：直接查询 SLItems 表获取库存快照。
-    仅在 Infor API 不可用时调用。
-    包含所有有库存的物料（采购件 + 制造件）。
-    """
-    conn = _db_connect(server, username, password, database, port)
-    query = """
-        SELECT SiteRef,
-               item,
-               Description,
-               PMTCode AS Sourcing,
-               ProductCode,
-               CAST(OnHand AS DECIMAL(20,8)) AS Per,
-               CAST(DerUnitCost AS DECIMAL(20,8)) AS Unitcost,
-               CAST(OnHand * DerUnitCost AS DECIMAL(20,8)) AS Unitscost
-        FROM [csi_datawarehouse].[dbo].[SLItems]
-        WHERE SiteRef IN ('310', '330', '410')
-          AND OnHand <> 0
-        ORDER BY SiteRef, ProductCode, item
-    """
-    df = pd.read_sql(query, conn)
-    conn.close()
-    return df
-
-
-def generate_opening_balance(
-    server=None, username=None, password=None, database=None, port=1433,
-    output_dir="Previous Balance",
-    use_api: bool = True,
-):
-    """
-    生成期初库存余额 Excel 文件（一个站点一个文件）。
-    文件写入 output_dir/site XXX.xlsx，供日常报表读取。
-    包含所有有库存的物料（采购件 + 制造件）。
-
-    数据来源优先级：
-      1. Infor CSI API（use_api=True，默认）：调用 SLItemCostingReport IDO
-         （clmParam 第二个字段 PMTCode 留空，包含所有物料类型）
-      2. SQL Fallback（use_api=False 或 API 失败时）：直接查询 SLItems 表，不过滤 PMTCode
-
-    参数：
-      server/username/password/database/port — SQL fallback 用的数据库连接参数
-      output_dir — Excel 文件输出目录
-      use_api    — 是否优先使用 Infor CSI API（默认 True）
-    """
-    print("=" * 60)
-    print("  生成期初库存余额文件")
-    print("=" * 60)
-
-    out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
-    site_info = {"310": "Plant1", "330": "Plant2", "410": "PNG"}
-    sites = ["310", "330", "410"]
-
-    # ── 尝试从 Infor CSI API 获取数据 ──
-    if use_api:
-        try:
-            token = _load_infor_token()
-        except RuntimeError as e:
-            print(f"  {e}")
-            print("  ⚠️  将降级使用 SQL 直连方式...")
-            use_api = False
-
-    if use_api:
-        print("  📡 数据来源：Infor CSI API")
-        results = []
-        api_failed_sites = []
-
-        for site_ref in sites:
-            try:
-                df = _fetch_infor_site(site_ref, token)
-            except RuntimeError as e:
-                print(f"  ❌ Site {site_ref} API 调用失败：{e}")
-                api_failed_sites.append(site_ref)
-                continue
-
-            if df.empty:
-                api_failed_sites.append(site_ref)
-                continue
-
-            # API 已直接返回 ProductCode 和 Source（Pmtcode/Prodcode），无需额外 enrich
-            if "ProductCode" not in df.columns:
-                df["ProductCode"] = ""
-            if "Source" not in df.columns:
-                df["Source"] = ""
-
-            _write_opening_excel(df, site_ref, out_path, site_info, results)
-
-            # 写入数据库（不删除旧数据，仅新增）
-            if server:
-                save_inventory_to_db(df, site_ref, server, username, password, database, port)
-
-        # 对 API 失败的站点尝试 SQL fallback
-        if api_failed_sites and server:
-            print(f"\n  ↩️  以下站点将使用 SQL fallback：{api_failed_sites}")
-            try:
-                fallback_df = _fetch_opening_via_sql(server, username, password, database, port)
-                for site_ref in api_failed_sites:
-                    site_df = fallback_df[fallback_df["SiteRef"] == site_ref].copy()
-                    site_df = site_df[["item", "Description", "Per", "Unitcost", "Unitscost", "ProductCode", "Sourcing"]].copy()
-                    site_df.columns = ["Item", "Description", "Per", "Unitcost", "Unitscost", "ProductCode", "Sourcing"]
-                    site_df["Item"] = site_df["Item"].astype(str).str.strip().str.upper()
-                    _write_opening_excel(site_df, site_ref, out_path, site_info, results)
-            except Exception as e:
-                print(f"  ❌ SQL fallback 也失败：{e}")
-        elif api_failed_sites:
-            print(f"  ⚠️  以下站点无法获取数据（无 SQL fallback 配置）：{api_failed_sites}")
-
-    else:
-        # 纯 SQL 模式
-        print("  🗄️  数据来源：SQL Server SLItems 表")
-        if not server:
-            print("  ❌ SQL 模式需要数据库连接参数（server/username/password/database）")
-            return None
-
-        try:
-            fallback_df = _fetch_opening_via_sql(server, username, password, database, port)
-        except Exception as e:
-            print(f"  ❌ SQL 查询失败：{e}")
-            return None
-
-        results = []
-        for site_ref in sites:
-            site_df = fallback_df[fallback_df["SiteRef"] == site_ref].copy()
-            site_df = site_df[["item", "Description", "Per", "Unitcost", "Unitscost", "ProductCode", "Sourcing"]].copy()
-            site_df.columns = ["Item", "Description", "Per", "Unitcost", "Unitscost", "ProductCode", "Sourcing"]
-            site_df["Item"] = site_df["Item"].astype(str).str.strip().str.upper()
-            _write_opening_excel(site_df, site_ref, out_path, site_info, results)
-
-    if not results:
-        print("  ⚠️ 所有站点均未能获取数据")
-        return None
-
-    grand = sum(r["value"] for r in results)
-    print(f"\n  📊 总计: {sum(r['items'] for r in results)} items, Grand Total: ${grand:,.2f}")
-    print(f"  📁 文件目录: {out_path.resolve()}")
-    return results
-
-
-def _write_opening_excel(df: pd.DataFrame, site_ref: str, out_path: Path,
-                          site_info: dict, results: list) -> None:
-    """将单站点期初数据写入 Excel 并追加到 results 列表"""
-    label = site_info.get(site_ref, site_ref)
-    fname = out_path / f"site {site_ref}.xlsx"
-
-    # 数值列统一保留 8 位小数
-    for col in ["Per", "Unitcost", "Unitscost"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").round(8)
-
-    df.to_excel(fname, index=False, sheet_name="Opening Balance")
-
-    total_items = len(df)
-    # 直接用 Unitscost（扩展金额）列求和；fallback 到 Per × Unitcost
-    if "Unitscost" in df.columns:
-        total_value = pd.to_numeric(df["Unitscost"], errors="coerce").fillna(0).sum()
-    else:
-        total_value = (
-            pd.to_numeric(df.get("Per", 0), errors="coerce").fillna(0) *
-            pd.to_numeric(df.get("Unitcost", 0), errors="coerce").fillna(0)
-        ).sum()
-
-    print(f"  ✅ Site {site_ref} ({label}): {total_items} items, 金额: ${total_value:,.2f}")
-    print(f"     → {fname}")
-    results.append({"site": site_ref, "label": label, "items": total_items, "value": total_value})
 
 
 # ──────────────────────────────────────────────────────────────
-# 守护进程 — 每月1日 00:15 生成期初 + 每天 09:00 跑报表
+# 守护进程 — 每天 00:00 同步 + 每天 09:00 跑报表
 # ──────────────────────────────────────────────────────────────
 DAEMON_HOUR_SNAPSHOT = 0
 DAEMON_MINUTE_SNAPSHOT = 0
@@ -2600,12 +2223,8 @@ def main():
     parser.add_argument("--db-port", type=int, default=int(os.environ.get("SQL_SERVER_PORT", 1433)))
     # 模式
     parser.add_argument("--site", default="310", help="单站点模式 (默认310)")
-    parser.add_argument("-f", "--prev-file", help="单站点期初余额Excel路径")
     parser.add_argument("--all-sites", action="store_true", help="批量运行310/330/410")
-    parser.add_argument("--daemon", action="store_true", help="守护模式：每月1日 00:15 生成期初 + 每天 09:00 跑报表")
-    parser.add_argument("--generate-opening", action="store_true", help="手动生成期初库存文件（优先 Infor CSI API，降级 SQL）")
-    parser.add_argument("--no-api", action="store_true", help="生成期初时强制使用 SQL 模式（跳过 Infor CSI API）")
-    parser.add_argument("--prev-dir", default=os.environ.get("PREV_DIR", "Previous Balance"))
+    parser.add_argument("--daemon", action="store_true", help="守护模式：每天 00:00 同步 + 09:00 跑报表")
     parser.add_argument("--output-dir", default=os.environ.get("OUTPUT_DIR", None))
     parser.add_argument("-o", "--output", help="输出文件名 (单站点模式)")
     parser.add_argument("--as-of-date", default="", help="模拟报表日期，格式 YYYY-MM-DD")
@@ -2648,15 +2267,7 @@ def main():
         print("   请在 .env 中配置后重试。")
         sys.exit(1)
 
-    if args.generate_opening:
-        # 手动生成期初模式（优先 Infor CSI API，降级 SQL）
-        generate_opening_balance(
-            server=args.server, username=args.username,
-            password=args.password, database=args.database,
-            port=args.db_port, output_dir=args.prev_dir,
-            use_api=not args.no_api,
-        )
-    elif args.daemon:
+    if args.daemon:
         if args.as_of_date:
             print("❌ 守护模式不支持固定 --as-of-date，请去掉该参数。")
             sys.exit(1)
