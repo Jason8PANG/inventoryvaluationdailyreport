@@ -2310,7 +2310,7 @@ def schedule_loop(run_func, args):
                 print(f"  🔄 定时任务：同步 daily_inventory_snapshot.py")
                 print(f"{'='*60}")
                 snapshot_script = Path(__file__).with_name("daily_inventory_snapshot.py")
-                balance_date = datetime.now().strftime("%Y-%m-%d")
+                balance_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
                 cmd = [sys.executable, str(snapshot_script), "--balance-date", balance_date]
                 print(f"  📋 执行: {' '.join(cmd)}")
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
