@@ -1024,14 +1024,14 @@ def fetch_prev_wip_from_db(server, username, password, database, port,
 # ──────────────────────────────────────────────────────────────
 def send_summary_email(
     result: dict,
-    to_addr: str = "jason.pang@nai-group.com;shirley.ni@nai-group.com;devin.hua@nai-group.com;chn_planners@nai-group.com;chn_buyer@nai-group.com",
-    cc_addr: str = "sky.li@nai-group.com;frank.liu@nai-group.com;shirley.ni@nai-group.com",
+    to_addr: str = "",
+    cc_addr: str = "",
     smtp_host: str = "localhost",
     smtp_port: int = 25,
     smtp_user: str = "",
     smtp_password: str = "",
     smtp_tls: bool = False,
-    from_addr: str = "inventory-report@nai-group.com",
+    from_addr: str = "",
     db_config: dict | None = None,
     report_date: Optional[str] = None,
 ):
@@ -2421,7 +2421,7 @@ def main():
     parser.add_argument("--email-cc",
         default=os.environ.get("MAIL_CC", ""))
     parser.add_argument("--email-from",
-        default=os.environ.get("MAIL_FROM", "suzinventoryvaluationdailyreport@nai-group.com"))
+        default=os.environ.get("MAIL_FROM", ""))
     # SMTP（优先级：.env → 默认值）
     parser.add_argument("--smtp-host",     default=os.environ.get("SMTP_HOST", "localhost"))
     parser.add_argument("--smtp-port",     type=int, default=int(os.environ.get("SMTP_PORT", 25)))
