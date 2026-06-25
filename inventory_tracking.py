@@ -2402,6 +2402,13 @@ def run_once(args):
 # CLI
 # ──────────────────────────────────────────────────────────────
 def main():
+    # 加载 .env 文件到环境变量（本地运行自动读取，Docker 下已由 compose 注入，不会覆盖）
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
     parser = argparse.ArgumentParser(
         description="库存金额跟踪系统（pymssql + SMTP）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
