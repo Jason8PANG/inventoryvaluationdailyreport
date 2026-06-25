@@ -1134,45 +1134,45 @@ def send_summary_email(
   <th style="width:12%;text-align:left">&nbsp;</th>
     <th style="width:14%">{prev_eom_label} Balance</th>
   <th style="width:12%">MTD Received</th>
+  <th style="width:12%">MTD Variances</th>
   <th style="width:12%">MTD Consumed</th>
   <th style="width:12%">MTD Other Transaction</th>
-  <th style="width:12%">MTD Variances</th>
-    <th style="width:14%">MTD Daily Balance</th>
+    <th style="width:14%">MTD Daily Balance<br><span style="font-size:8pt;font-weight:normal">Daily Balance = Prev Balance + Received + Variances + Consumed + Other</span></th>
 </tr>
 <tr>
   <td style="text-align:left;font-weight:bold">RM</td>
   <td>{fmt_num(rm.get('prev', 0))}</td>
   <td>{fmt_num(rm.get('recv', 0))}</td>
+  <td>{fmt_num(rm_var)}</td>
   <td>{fmt_num(rm.get('cons', 0))}</td>
   <td>{fmt_num(rm.get('other', 0))}</td>
-  <td>{fmt_num(rm_var)}</td>
     <td><b>{fmt_num(rm_bal)}</b></td>
 </tr>
 <tr>
   <td style="text-align:left;font-weight:bold">FG/Semi FG</td>
   <td>{fmt_num(fg.get('prev', 0))}</td>
   <td>{fmt_num(fg.get('recv', 0))}</td>
+  <td>{fmt_num(fg_var)}</td>
   <td>{fmt_num(fg.get('cons', 0))}</td>
   <td>{fmt_num(fg.get('other', 0))}</td>
-  <td>{fmt_num(fg_var)}</td>
     <td><b>{fmt_num(fg_bal)}</b></td>
 </tr>
 <tr style="background-color:#FFF2CC">
   <td style="text-align:left;font-weight:bold">WIP</td>
   <td>{fmt_num(prev_wip)}</td>
   <td>&nbsp;</td>
-  <td>&nbsp;</td>
-  <td>&nbsp;</td>
   <td>{fmt_num(wip_var)}</td>
+  <td>&nbsp;</td>
+  <td>&nbsp;</td>
   <td><b>{fmt_num(wip_bal)}</b></td>
 </tr>
 <tr style="background-color:#D6E4F0;font-weight:bold">
   <td style="text-align:left">Total</td>
   <td>{fmt_num(t_prev)}</td>
   <td>{fmt_num(t_recv)}</td>
+  <td>{fmt_num(t_var)}</td>
   <td>{fmt_num(t_cons)}</td>
   <td>{fmt_num(t_other)}</td>
-  <td>{fmt_num(t_var)}</td>
   <td><b>{fmt_num(t_bal)}</b></td>
 </tr>
 </table>
@@ -1217,48 +1217,69 @@ def send_summary_email(
   <th style="width:12%;text-align:left">&nbsp;</th>
     <th style="width:14%">{prev_eom_label} Balance</th>
   <th style="width:12%">MTD Received</th>
+  <th style="width:12%">MTD Variances</th>
   <th style="width:12%">MTD Consumed</th>
   <th style="width:12%">MTD Other Transaction</th>
-  <th style="width:12%">MTD Variances</th>
-  <th style="width:14%">MTD Daily Balance</th>
+  <th style="width:14%">MTD Daily Balance<br><span style="font-size:8pt;font-weight:normal">Daily Balance = Prev Balance + Received + Variances + Consumed + Other</span></th>
 </tr>
 <tr>
   <td style="text-align:left;font-weight:bold">RM</td>
   <td>{fmt_num(asia_rm_prev)}</td>
   <td>{fmt_num(asia_rm_recv)}</td>
+  <td>{fmt_num(asia_rm_var)}</td>
   <td>{fmt_num(asia_rm_cons)}</td>
   <td>{fmt_num(asia_rm_other)}</td>
-  <td>{fmt_num(asia_rm_var)}</td>
   <td><b>{fmt_num(asia_rm_bal)}</b></td>
 </tr>
 <tr>
   <td style="text-align:left;font-weight:bold">FG/Semi FG</td>
   <td>{fmt_num(asia_fg_prev)}</td>
   <td>{fmt_num(asia_fg_recv)}</td>
+  <td>{fmt_num(asia_fg_var)}</td>
   <td>{fmt_num(asia_fg_cons)}</td>
   <td>{fmt_num(asia_fg_other)}</td>
-  <td>{fmt_num(asia_fg_var)}</td>
   <td><b>{fmt_num(asia_fg_bal)}</b></td>
 </tr>
 <tr style="background-color:#FFF2CC">
   <td style="text-align:left;font-weight:bold">WIP</td>
   <td>{fmt_num(asia_prev_wip)}</td>
   <td>&nbsp;</td>
-  <td>&nbsp;</td>
-  <td>&nbsp;</td>
   <td>{fmt_num(asia_wip_var)}</td>
+  <td>&nbsp;</td>
+  <td>&nbsp;</td>
   <td><b>{fmt_num(asia_wip_bal)}</b></td>
 </tr>
 <tr style="background-color:#4472C4;color:white;font-weight:bold">
   <td style="text-align:left">Total</td>
   <td>{fmt_num(asia_t_prev)}</td>
   <td>{fmt_num(asia_t_recv)}</td>
+  <td>{fmt_num(asia_t_var)}</td>
   <td>{fmt_num(asia_t_cons)}</td>
   <td>{fmt_num(asia_t_other)}</td>
-  <td>{fmt_num(asia_t_var)}</td>
   <td><b>{fmt_num(asia_t_bal)}</b></td>
 </tr>
 </table>
+"""
+
+    # ── 栏位解释 ──
+    tables_html += """
+<div style="margin-top:24px;font-size:9pt;color:#333;max-width:1050px">
+<p style="font-weight:bold;font-size:10pt;margin-bottom:4px">Column Explanations / 栏位说明:</p>
+<ul style="margin-top:4px;padding-left:20px;line-height:1.6">
+  <li><b>Balance</b> — 上月底库存余额 (End of Previous Month Inventory Balance)</li>
+  <li><b>MTD Received</b> — 当月入库金额<br>
+      &nbsp;&nbsp;• 采购料 (RM/Purchased): 采购价 × 数量 (Purchase Price × Qty)<br>
+      &nbsp;&nbsp;• 半成品/成品 (Semi FG/FG/Manufactured): 入库数量 × 物料标准成本 (Receipt Qty × Standard Cost)</li>
+  <li><b>MTD Variances</b> — 当月差异金额<br>
+      &nbsp;&nbsp;• 采购料 (RM): 采购价差汇总 (Purchase Price Variance)<br>
+      &nbsp;&nbsp;• 制造件 (Semi FG/FG): 物料用量差异 (Material Usage Variance)<br>
+      &nbsp;&nbsp;• WIP: 当期 WIP 与上月底 WIP 的差值 (仅反映变动)</li>
+  <li><b>MTD Consumed</b> — 当月出库金额，按物料成本价发料或发货的汇总 (Issue/Shipment at Standard Cost)</li>
+  <li><b>MTD Other Transaction</b> — 当月库存调整汇总（入库/出库调整）(Inventory Adjustments)</li>
+  <li><b>MTD Daily Balance</b> — 截至报告日库存余额 (Balance as of Report Date)<br>
+      &nbsp;&nbsp;公式: Daily Balance = Prev Balance + Received + Variances + Consumed + Other</li>
+</ul>
+</div>
 """
 
     html_body = f"""<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt">
