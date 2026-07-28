@@ -524,17 +524,39 @@ class InventoryTracker:
         except Exception as e:
             print(f"  ⚠️  查询 PMTCode 失败：{e}，按 'P' 处理")
 
-        # W/J 退料对 RM 不计入 MTD Received（只是 I/J 发料的冲回）
-        wj_rm_mask = (
+        # W/J 退料对 RM 不计入 MTD（与配对的 I/J 发料一起排除）
+        # 配对条件：同一 Item + 同一 RefNum + 数量正负抵消
+        wj_rm_cond = (
             (trans_df["TransType"].str.strip().str.upper() == "W") &
             (trans_df["RefType"].str.strip().str.upper() == "J") &
             (trans_df["Item"].map(pmtcode_map) == "P")
         )
-        wj_overridden = int(wj_rm_mask.sum())
-        if wj_overridden:
-            trans_df.loc[wj_rm_mask, "Category"] = "Ignored"
-            wj_amt = trans_df.loc[wj_rm_mask, "TotalAmt"].sum()
-            print(f"  ℹ️  RM W/J 退料不计入 MTD: {wj_overridden:,} 条 (${wj_amt:,.2f})")
+        wj_rm = trans_df[wj_rm_cond].copy()
+        if not wj_rm.empty:
+            # 构造配对 key: Item + RefNum + abs Qty
+            wj_rm["_pair_key"] = (
+                wj_rm["Item"] + "|" + wj_rm["RefNum"].fillna("") + "|" +
+                wj_rm["Qty"].abs().astype(str)
+            )
+            pair_keys = set(wj_rm["_pair_key"].unique())
+
+            # 在 I/J 中找匹配（同一 Item + RefNum + abs Qty）
+            ij_to_exclude = (
+                (trans_df["TransType"].str.strip().str.upper() == "I") &
+                (trans_df["RefType"].str.strip().str.upper() == "J") &
+                (trans_df["Item"] + "|" + trans_df["RefNum"].fillna("") + "|" +
+                 trans_df["Qty"].abs().astype(str)).isin(pair_keys)
+            )
+            wj_count = int(wj_rm_cond.sum())
+            ij_count = int(ij_to_exclude.sum())
+            trans_df.loc[wj_rm_cond, "Category"] = "Ignored"
+            trans_df.loc[ij_to_exclude, "Category"] = "Ignored"
+            total_excluded = wj_count + ij_count
+            excluded_amt = (
+                trans_df.loc[wj_rm_cond, "TotalAmt"].sum() +
+                trans_df.loc[ij_to_exclude, "TotalAmt"].sum()
+            )
+            print(f"  ℹ️  RM 工单退料配对排除: {wj_count:,} 条 W/J + {ij_count:,} 条 I/J = {total_excluded:,} 条 (${excluded_amt:,.2f})")
 
         # Summary aggregation
         items: Dict[str, ItemBalance] = {}
