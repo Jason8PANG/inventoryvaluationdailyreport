@@ -524,6 +524,18 @@ class InventoryTracker:
         except Exception as e:
             print(f"  ⚠️  查询 PMTCode 失败：{e}，按 'P' 处理")
 
+        # W/J 退料对 RM 不计入 MTD Received（只是 I/J 发料的冲回）
+        wj_rm_mask = (
+            (trans_df["TransType"].str.strip().str.upper() == "W") &
+            (trans_df["RefType"].str.strip().str.upper() == "J") &
+            (trans_df["Item"].map(pmtcode_map) == "P")
+        )
+        wj_overridden = int(wj_rm_mask.sum())
+        if wj_overridden:
+            trans_df.loc[wj_rm_mask, "Category"] = "Ignored"
+            wj_amt = trans_df.loc[wj_rm_mask, "TotalAmt"].sum()
+            print(f"  ℹ️  RM W/J 退料不计入 MTD: {wj_overridden:,} 条 (${wj_amt:,.2f})")
+
         # Summary aggregation
         items: Dict[str, ItemBalance] = {}
         for _, row in prev_df.iterrows():
