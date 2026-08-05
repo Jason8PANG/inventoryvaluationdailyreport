@@ -25,6 +25,7 @@ load_dotenv()
 # ── 复用 inventory_tracking.py 的常量和函数 ──
 from inventory_tracking import (
     _load_infor_token,
+    _http_get_with_retry,
     INFOR_API_BASE,
     INFOR_TENANT,
     _db_connect,
@@ -85,25 +86,19 @@ def _fetch_ido_data(site_ref: str, token: str, filter_str: str,
         "Content-Type": "application/json",
     }
 
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        if e.code == 401 and not token_expired_retry:
+    raw, http_code, http_body = _http_get_with_retry(
+        url, headers, timeout=120, site_ref=site_ref, label="SLMatltrans"
+    )
+    if http_code is not None:
+        if http_code == 401 and not token_expired_retry:
             print(f"    🔄 SLMatltrans Site {site_ref}: Token 过期 (401)，强制刷新...")
             new_token = _load_infor_token(force_refresh=True)
             return _fetch_ido_data(site_ref, new_token, filter_str, token_expired_retry=True)
         else:
             raise RuntimeError(
-                f"SLMatltrans API HTTP {e.code} - Site {site_ref}\n"
-                f"   响应: {body[:300]}"
-            ) from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(
-            f"SLMatltrans 网络连接失败 - Site {site_ref}: {e.reason}"
-        ) from e
+                f"SLMatltrans API HTTP {http_code} - Site {site_ref}\n"
+                f"   响应: {http_body[:300]}"
+            )
 
     data = json.loads(raw)
     # API 返回 {"Items": [...]} 或 {"SLMatltrans": {"items": [...]}}

@@ -1611,6 +1611,39 @@ def _load_infor_token(force_refresh: bool = False) -> str:
 
 
 
+def _http_get_with_retry(url: str, headers: dict, timeout: int,
+                         site_ref: str, label: str, retries: int = 3) -> tuple:
+    """
+    带重试的 HTTP GET。
+    网络错误（DNS 解析失败、超时、连接重置等）自动重试 retries 次，指数退避。
+
+    返回 (raw, http_code, http_body)：
+      - 成功: (raw_text, None, None)
+      - HTTP 错误: (None, code, body_text) — 不重试，交由上层处理（如 401 刷新 Token）
+    网络错误重试耗尽后抛 RuntimeError。
+    """
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8"), None, None
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            return None, e.code, body
+        except urllib.error.URLError as e:
+            last_err = e
+            reason = getattr(e, "reason", e)
+            if attempt < retries:
+                wait = 2 ** (attempt - 1)
+                print(f"  ⚠️  {label} Site {site_ref} 网络错误 (第{attempt}次): {reason}，{wait}s 后重试...")
+                time.sleep(wait)
+    raise RuntimeError(
+        f"❌ 网络连接失败 - {label} - Site {site_ref}: {last_err}\n"
+        f"   已重试 {retries} 次，请检查 VPN 或网络连接"
+    ) from last_err
+
+
 def _fetch_infor_site(site_ref: str, token: str, token_expired_retry: bool = False) -> pd.DataFrame:
     """
     调用 Infor CSI IDO API 获取指定站点的库存成本报告（Purchased Material）。
@@ -1637,37 +1670,30 @@ def _fetch_infor_site(site_ref: str, token: str, token_expired_retry: bool = Fal
 
     print(f"  🌐 调用 Infor API: Site {site_ref} ({site_cfg['mongoose_config']})...")
 
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        if e.code == 401 and not token_expired_retry:
+    raw, http_code, http_body = _http_get_with_retry(
+        url, headers, timeout=60, site_ref=site_ref, label="Infor API"
+    )
+    if http_code is not None:
+        if http_code == 401 and not token_expired_retry:
             print(f"  🔄 Site {site_ref}: Token 过期 (401)，强制刷新...")
             new_token = _load_infor_token(force_refresh=True)
             return _fetch_infor_site(site_ref, new_token, token_expired_retry=True)
-        elif e.code == 401:
+        elif http_code == 401:
             raise RuntimeError(
                 f"❌ Infor API 认证失败 (401) - Site {site_ref}\n"
                 f"   Token 刷新后仍然无效，请检查 OAuth2 凭据"
-            ) from e
-        elif e.code == 502:
+            )
+        elif http_code == 502:
             raise RuntimeError(
                 f"❌ Infor API 502 Bad Gateway - Site {site_ref}\n"
                 f"   可能原因：VPN 未连接、Infor CloudSuite 服务暂时不可用\n"
-                f"   响应：{body[:300]}"
-            ) from e
+                f"   响应：{http_body[:300]}"
+            )
         else:
             raise RuntimeError(
-                f"❌ Infor API HTTP {e.code} - Site {site_ref}\n"
-                f"   响应：{body[:300]}"
-            ) from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(
-            f"❌ 网络连接失败 - Site {site_ref}: {e.reason}\n"
-            f"   请检查 VPN 或网络连接"
-        ) from e
+                f"❌ Infor API HTTP {http_code} - Site {site_ref}\n"
+                f"   响应：{http_body[:300]}"
+            )
 
     try:
         data = json.loads(raw)
@@ -1761,35 +1787,29 @@ def _fetch_wip_site(site_ref: str, token: str, token_expired_retry: bool = False
 
     print(f"  🌐 WIP API: Site {site_ref} ({site_cfg['mongoose_config']})...")
 
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        if e.code == 401 and not token_expired_retry:
+    raw, http_code, http_body = _http_get_with_retry(
+        url, headers, timeout=60, site_ref=site_ref, label="WIP API"
+    )
+    if http_code is not None:
+        if http_code == 401 and not token_expired_retry:
             print(f"  🔄 WIP Site {site_ref}: Token 过期 (401)，强制刷新...")
             new_token = _load_infor_token(force_refresh=True)
             return _fetch_wip_site(site_ref, new_token, token_expired_retry=True)
-        elif e.code == 401:
+        elif http_code == 401:
             raise RuntimeError(
                 f"❌ WIP API 认证失败 (401) - Site {site_ref}\n"
                 f"   Token 刷新后仍然无效，请检查 OAuth2 凭据"
-            ) from e
-        elif e.code == 502:
+            )
+        elif http_code == 502:
             raise RuntimeError(
                 f"❌ WIP API 502 Bad Gateway - Site {site_ref}\n"
-                f"   响应：{body[:300]}"
-            ) from e
+                f"   响应：{http_body[:300]}"
+            )
         else:
             raise RuntimeError(
-                f"❌ WIP API HTTP {e.code} - Site {site_ref}\n"
-                f"   响应：{body[:300]}"
-            ) from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(
-            f"❌ WIP 网络连接失败 - Site {site_ref}: {e.reason}"
-        ) from e
+                f"❌ WIP API HTTP {http_code} - Site {site_ref}\n"
+                f"   响应：{http_body[:300]}"
+            )
 
     try:
         data = json.loads(raw)
